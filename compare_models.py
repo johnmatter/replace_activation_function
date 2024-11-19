@@ -1,4 +1,5 @@
 import tensorflow as tf
+from tensorflow.keras.applications.resnet50 import ResNet50, preprocess_input
 from ModelWrapper import ModelWrapper
 from ActivationFunction import ActivationFunction
 import matplotlib.pyplot as plt
@@ -39,8 +40,8 @@ def compare_predictions(original_preds, modified_preds, top_k=5):
     
     # Print top k predictions for both models
     for orig_idx, mod_idx in zip(orig_indices, mod_indices):
-        orig_label = original_preds['predicted_labels'][0]
-        mod_label = modified_preds['predicted_labels'][0]
+        orig_label = original_preds['predicted_labels'][0][0]
+        mod_label = modified_preds['predicted_labels'][0][0]
         print(f"{orig_label:30} {orig_probs[orig_idx]:10.4f} {mod_probs[mod_idx]:10.4f}")
 
 def main():
@@ -49,24 +50,15 @@ def main():
     
     # Load test image
     image = load_image_from_url(image_url)
-    
-    # Create debug configuration
-    debug_config = {
-        'print_network_split_debug': False,
-        'print_activation_functions': False,
-        'print_network_config': False,
-        'print_layer_outputs': False,
-        'print_layer_activations': False,
-    }
 
-    # Initialize original model (using ViT as an example)
+    # Initialize original model
     print("Loading original model...")
     original_model = ModelWrapper(
-        model_name="google/vit-base-patch16-224",
+        model_name="resnet50",
         model_type="image",
-        debug=debug_config,
-        model_class=TFViTForImageClassification,
-        processor_class=ViTImageProcessor
+        model_class=ResNet50,
+        processor_class=preprocess_input,
+        is_huggingface=False
     )
     original_model.create_base_model()
     
@@ -74,19 +66,19 @@ def main():
     print("Getting predictions from original model...")
     original_preds = original_model.predict(image)
 
-    # Initialize modified model (using ViT as an example)
-    print("\nLoading and modifying model with Taylor approximations...")
+    # Initialize modified model
+    print("\nLoading and modifying model with Taylor series approximations...")
     modified_model = ModelWrapper(
-        model_name="google/vit-base-patch16-224",
+        model_name="resnet50",
         model_type="image",
-        debug=debug_config,
-        model_class=TFViTForImageClassification,
-        processor_class=ViTImageProcessor
+        model_class=ResNet50,
+        processor_class=preprocess_input,
+        is_huggingface=False
     )
     modified_model.create_base_model()
     
     # Create activation function approximation
-    taylor_activation = ActivationFunction(degree=3, piecewise=True)
+    taylor_activation = ActivationFunction(degree=3)
     
     # Split and replace activation layers
     modified_model.model = modified_model.split_activation_layers()

@@ -1,3 +1,4 @@
+from typing import Any, Dict, List, Union, Optional, Callable
 import numpy as np
 import tensorflow as tf
 from transformers import (
@@ -6,41 +7,88 @@ from transformers import (
     AutoImageProcessor,
     ResNetForImageClassification
 )
+from PIL import Image
+
+from PredictionDecoder import PredictionDecoder
+
+# Keras includes the following models:
+# - ResNet50, ResNet101, ResNet152, ResNet50V2, ResNet101V2, ResNet152V2
+# - VGG16, VGG19
+# - InceptionV3
+# - InceptionResNetV2
+# - MobileNet, MobileNetV2, MobileNetV3Small, MobileNetV3Large
+# - DenseNet121, DenseNet169, DenseNet201
+# - NASNetMobile, NASNetLarge
+# - EfficientNetB0 through EfficientNetB7
+# - Xception
+# - ConvNeXtTiny, ConvNeXtSmall, ConvNeXtBase, ConvNeXtLarge
 
 class ModelWrapper:
-    def __init__(self, model_name="microsoft/resnet-50", model_type="image", debug=False, model_class=None, processor_class=None):
+    def __init__(
+        self, 
+        model_name: str = "microsoft/resnet-50", 
+        model_type: str = "image", 
+        debug: Dict[str, bool] = None, 
+        model_class: Optional[Any] = None, 
+        processor_class: Optional[Any] = None, 
+        is_huggingface: bool = True
+    ) -> None:
         self.model_name = model_name
-        self.model_type = model_type  # "image" or "text"
+        self.model_type = model_type
         self.debug = debug
         self.model = None
         self.processor = None
-        self.model_class = model_class  # Class for the model
-        self.processor_class = processor_class  # Class for the processor
+        self.model_class = model_class
+        self.processor_class = processor_class
+        self.is_huggingface = is_huggingface
+        self.initialize_debug()
+
+    def initialize_debug(self) -> None:
+        if self.debug is None:
+            self.debug = {
+                'print_network_split_debug': False,
+            }
         
-    def create_base_model(self):
+    def create_base_model(self) -> 'ModelWrapper':
         """Initialize the model and processor based on model type"""
-        if self.model_class is not None and self.processor_class is not None:
-            self.model = self.model_class.from_pretrained(self.model_name)
-            self.processor = self.processor_class.from_pretrained(self.model_name)
+        if self.is_huggingface:
+            if self.model_class is not None and self.processor_class is not None:
+                self.model = self.model_class.from_pretrained(self.model_name)
+                self.processor = self.processor_class.from_pretrained(self.model_name)
+            else:
+                raise ValueError("Model class and processor class must be provided for HuggingFace models.")
         else:
-            raise ValueError("Model class and processor class must be provided.")
+            # Handle native TensorFlow models
+            if self.model_class is not None:
+                self.model = self.model_class(
+                    weights='imagenet',
+                    include_top=True,
+                    input_shape=(224, 224, 3)
+                )
+                # For TF models, processor is typically just a preprocessing function
+                self.processor = self.processor_class
+            else:
+                raise ValueError("Model class must be provided for TensorFlow models.")
         return self
 
-    def split_activation_layers(self):
-        # For HuggingFace models, we need to access the underlying keras model
+    def split_activation_layers(self) -> tf.keras.Model:
+        """Split activation layers from their parent layers"""
+        # Get the base model depending on the type
         if hasattr(self.model, 'keras_model'):
+            # HuggingFace models with direct Keras model
             base_model = self.model.keras_model
         elif hasattr(self.model, 'vit') and hasattr(self.model.vit, 'encoder'):
-            # For ViT models, we need to create a proper Keras model first
+            # HuggingFace ViT models
             base_model = self.model.vit
-            # Use the config to determine input shape
             image_size = self.model.config.image_size
-            num_channels = 3  # RGB images
-            # Change the input shape to match the expected format (batch_size, height, width, channels)
+            num_channels = 3
             inputs = tf.keras.Input(shape=(image_size, image_size, num_channels))
-            x = inputs  # Remove the transpose operation since ViT expects (batch_size, height, width, channels)
+            x = inputs
             x = base_model(x)
             base_model = tf.keras.Model(inputs=inputs, outputs=x)
+        elif isinstance(self.model, tf.keras.Model):
+            # Native TensorFlow/Keras models
+            base_model = self.model
         else:
             raise ValueError("This model type is not currently supported for activation splitting")
         
@@ -164,7 +212,7 @@ class ModelWrapper:
         
         return new_model
         
-    def replace_activations(self, activation_function):
+    def replace_activations(self, activation_function: Callable) -> 'ModelWrapper':
         for layer in self.model.layers:
 
             if isinstance(layer, tf.keras.layers.Activation):
@@ -181,23 +229,18 @@ class ModelWrapper:
                 return self
 
     def preprocess(self, inputs):
-        """Preprocess inputs based on model type"""
-        if self.model_type == "image":
-            if not isinstance(inputs, list):
-                inputs = [inputs]
+        if self.is_huggingface:
             return self.processor(inputs, return_tensors="tf")
-        
-        elif self.model_type == "text":
-            if not isinstance(inputs, list):
-                inputs = [inputs]
-            return self.processor(
-                inputs,
-                padding=True,
-                truncation=True,
-                return_tensors="tf"
-            )
+        else:
+            # For ResNet50 and similar models
+            if isinstance(inputs, Image.Image):
+                # Convert PIL Image to numpy array
+                inputs = np.array(inputs)
+            # Expand dimensions to create batch of size 1
+            inputs = np.expand_dims(inputs, axis=0)
+            return self.processor(inputs)
 
-    def predict(self, inputs):
+    def predict(self, inputs: Union[str, List[str], np.ndarray, List[np.ndarray]]) -> Dict[str, Any]:
         """Make predictions on inputs"""
         # Ensure model and processor are loaded
         if self.model is None or self.processor is None:
@@ -209,20 +252,16 @@ class ModelWrapper:
         # Get predictions
         outputs = self.model(processed_inputs)
         
-        # Handle different output formats
-        if self.model_type == "image":
-            logits = outputs.logits
-            predictions = tf.nn.softmax(logits, axis=-1)
-            predicted_labels = tf.argmax(predictions, axis=-1)
-            # Convert label indices to actual labels
-            label_names = [self.model.config.id2label[idx] for idx in predicted_labels.numpy()]
-        else:
-            predictions = tf.nn.softmax(outputs.logits, axis=-1)
-            predicted_labels = tf.argmax(predictions, axis=-1)
-            label_names = predicted_labels.numpy()  # For text models, usually just return the class index
-            
-        return {
-            'probabilities': predictions.numpy(),
-            'predicted_labels': label_names,
-            'raw_outputs': outputs
+        # Create model info dictionary
+        model_info = {
+            'is_huggingface': self.is_huggingface,
+            'model_type': self.model_type,
+            'model_name': self.model_name
         }
+        
+        # Add HuggingFace specific info if needed
+        if self.is_huggingface:
+            model_info['id2label'] = self.model.config.id2label
+        
+        # Use PredictionDecoder to handle the outputs
+        return PredictionDecoder.decode(outputs, model_info)
