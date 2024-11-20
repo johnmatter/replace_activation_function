@@ -15,7 +15,7 @@ def load_image_from_url(url, size=(224, 224)):
     image = image.resize(size)
     return image
 
-def compare_predictions(original_preds, modified_preds, top_k=5):
+def compare_predictions(original_preds, modified_preds):
     """Compare and display predictions from both models"""
     print("\nPrediction Comparison:")
     print("-" * 50)
@@ -33,12 +33,12 @@ def compare_predictions(original_preds, modified_preds, top_k=5):
         print(f"{orig_labels[i]:30} {orig_probs[i]:10.4f} {mod_probs[i]:10.4f}")
 
 def main():
-    # Test image URL
+    # ----------------------------------------------------------------
+    # Test image
     image_url = "https://images.pexels.com/photos/104827/cat-pet-animal-domestic-104827.jpeg"
-    
-    # Load test image
     image = load_image_from_url(image_url)
 
+    # ----------------------------------------------------------------
     # Initialize original model
     print("Loading original model...")
     original_model = ModelWrapper(
@@ -49,11 +49,8 @@ def main():
         is_huggingface=False
     )
     original_model.create_base_model()
-    
-    # Get predictions from original model
-    print("Getting predictions from original model...")
-    original_preds = original_model.predict(image)
 
+    # ----------------------------------------------------------------
     # Initialize modified model
     print("\nLoading and modifying model with Taylor series approximations...")
     modified_model = ModelWrapper(
@@ -72,10 +69,16 @@ def main():
     modified_model.model = modified_model.split_activation_layers()
     modified_model.replace_activations(taylor_activation)
     
+    # ----------------------------------------------------------------
+    # Get predictions from original model
+    print("Getting predictions from original model...")
+    original_preds = original_model.predict(image)
+
     # Get predictions from modified model
     print("Getting predictions from modified model...")
     modified_preds = modified_model.predict(image)
 
+    # ----------------------------------------------------------------
     # Compare results
     compare_predictions(original_preds, modified_preds)
 
