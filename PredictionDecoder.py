@@ -43,10 +43,11 @@ class PredictionDecoder:
     def decode(
         outputs: Any,
         model_info: Dict[str, Any],
-        top_k: int = 1
     ) -> Dict[str, Any]:
         """Create a decoder instance and process the outputs"""
         decoder = PredictionDecoder()
+        top_k = model_info.get('top_k', 5)
+
         if model_info['is_huggingface']:
             return decoder._decode_huggingface(outputs, model_info, top_k)
         else:
@@ -69,16 +70,18 @@ class PredictionDecoder:
             # Use keras_decode_predictions for ImageNet models
             decoded_predictions = keras_decode_predictions(predictions.numpy(), top=top_k)
             
-            # Format the results
+            # Format the results consistently
             batch_labels = []
             batch_probs = []
             for batch_preds in decoded_predictions:
-                batch_labels.append([pred[1] for pred in batch_preds])  # Class names
-                batch_probs.append([pred[2] for pred in batch_preds])   # Probabilities
+                labels = [pred[1] for pred in batch_preds]
+                probs = [pred[2] for pred in batch_preds]
+                batch_labels.append(labels)
+                batch_probs.append(probs)
             
             return {
                 'probabilities': predictions.numpy(),
-                'predicted_labels': [[pred[0][1]] for pred in decoded_predictions],  # Just the top prediction for compatibility
+                'predicted_labels': batch_labels,
                 'top_k_probabilities': np.array(batch_probs),
                 'top_k_labels': batch_labels
             }

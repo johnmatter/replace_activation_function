@@ -213,20 +213,26 @@ class ModelWrapper:
         return new_model
         
     def replace_activations(self, activation_function: Callable) -> 'ModelWrapper':
+        replacements_made = 0
         for layer in self.model.layers:
-
             if isinstance(layer, tf.keras.layers.Activation):
                 # Replace sigmoid activations
                 if layer.activation == tf.keras.activations.sigmoid:  
                     layer.activation = activation_function
+                    replacements_made += 1
                 # Keep ReLU as is
                 elif layer.activation == tf.keras.activations.relu:   
                     continue
-                # Keep other activations as is. We can extend this to other activations later.
+                # Keep other activations as is
                 else:
                     continue
-
-                return self
+        
+        if replacements_made == 0:
+            print("Warning: No activation functions were replaced!")
+        else:
+            print(f"Replaced {replacements_made} activation functions")
+        
+        return self
 
     def preprocess(self, inputs):
         if self.is_huggingface:
@@ -256,7 +262,8 @@ class ModelWrapper:
         model_info = {
             'is_huggingface': self.is_huggingface,
             'model_type': self.model_type,
-            'model_name': self.model_name
+            'model_name': self.model_name,
+            'top_k': 5
         }
         
         # Add HuggingFace specific info if needed

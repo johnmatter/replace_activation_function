@@ -7,20 +7,12 @@ from PIL import Image
 import requests
 from io import BytesIO
 import numpy as np
-from transformers import (
-    TFViTForImageClassification,
-    ViTImageProcessor,
-    TFDeiTForImageClassification,
-    DeiTFeatureExtractor,
-    TFConvNextForImageClassification,
-    ConvNextImageProcessor
-)
 
-def load_image_from_url(url):
+def load_image_from_url(url, size=(224, 224)):
     """Load and preprocess an image from a URL"""
     response = requests.get(url)
     image = Image.open(BytesIO(response.content))
-    image = image.resize((224, 224))  # Resize to expected size
+    image = image.resize(size)
     return image
 
 def compare_predictions(original_preds, modified_preds, top_k=5):
@@ -29,20 +21,16 @@ def compare_predictions(original_preds, modified_preds, top_k=5):
     print("-" * 50)
     print(f"{'Class':30} {'Original':>10} {'Modified':>10}")
     print("-" * 50)
-    
-    # Get top k predictions for both models
-    orig_probs = original_preds['probabilities'][0]
-    mod_probs = modified_preds['probabilities'][0]
-    
-    # Get indices of top k predictions
-    orig_indices = np.argsort(orig_probs)[-top_k:][::-1]
-    mod_indices = np.argsort(mod_probs)[-top_k:][::-1]
+
+    # Get the pre-sorted top k predictions
+    orig_probs = original_preds['top_k_probabilities'][0]
+    mod_probs = modified_preds['top_k_probabilities'][0]
+    orig_labels = original_preds['top_k_labels'][0]
+    mod_labels = modified_preds['top_k_labels'][0]
     
     # Print top k predictions for both models
-    for orig_idx, mod_idx in zip(orig_indices, mod_indices):
-        orig_label = original_preds['predicted_labels'][0][0]
-        mod_label = modified_preds['predicted_labels'][0][0]
-        print(f"{orig_label:30} {orig_probs[orig_idx]:10.4f} {mod_probs[mod_idx]:10.4f}")
+    for i in range(len(orig_labels)):
+        print(f"{orig_labels[i]:30} {orig_probs[i]:10.4f} {mod_probs[i]:10.4f}")
 
 def main():
     # Test image URL
