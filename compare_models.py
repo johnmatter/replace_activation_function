@@ -1,12 +1,15 @@
 import tensorflow as tf
 from tensorflow.keras.applications.resnet50 import ResNet50, preprocess_input
-from ModelWrapper import ModelWrapper
-from ActivationFunction import ActivationFunction
+
 import matplotlib.pyplot as plt
 from PIL import Image
 import requests
 from io import BytesIO
 import numpy as np
+
+from ModelWrapper import ModelWrapper
+from ActivationFunction import ActivationFunction, ActivationFunctionFactory
+from figlet_color import MOXIEPrettyPrint
 
 def load_image_from_url(url, size=(224, 224)):
     """Load and preprocess an image from a URL"""
