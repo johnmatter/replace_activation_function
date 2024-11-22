@@ -1,5 +1,6 @@
 import tensorflow as tf
 from tensorflow.keras.applications.resnet50 import ResNet50, preprocess_input
+from tensorflow.keras import activations
 
 import matplotlib.pyplot as plt
 from PIL import Image
@@ -8,7 +9,11 @@ from io import BytesIO
 import numpy as np
 
 from ModelWrapper import ModelWrapper
-from ActivationFunction import ActivationFunction, ActivationFunctionFactory
+from ActivationFunction import (
+    ActivationFunction, 
+    ActivationFunctionFactory, 
+    ApproximationType
+)
 from figlet_color import MOXIEPrettyPrint
 
 def load_image_from_url(url, size=(224, 224)):
@@ -55,7 +60,7 @@ def main():
 
     # ----------------------------------------------------------------
     # Initialize modified model
-    print("\nLoading and modifying model with Taylor series approximations...")
+    print("\nLoading and modifying model with Chebyshev polynomial approximations...")
     modified_model = ModelWrapper(
         model_name="resnet50",
         model_type="image",
@@ -66,11 +71,16 @@ def main():
     modified_model.create_base_model()
     
     # Create activation function approximation
-    taylor_activation = ActivationFunction(degree=3)
+    factory = ActivationFunctionFactory(
+        base_activation=activations.sigmoid,
+        degree=3,
+        approximation_type=ApproximationType.CHEBYSHEV
+    )
+    chebyshev_activation = factory.create()
     
     # Split and replace activation layers
     modified_model.model = modified_model.split_activation_layers()
-    modified_model.replace_activations(taylor_activation)
+    modified_model.replace_activations(chebyshev_activation)
     
     # ----------------------------------------------------------------
     # Get predictions from original model

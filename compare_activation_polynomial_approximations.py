@@ -2,38 +2,52 @@ import tensorflow as tf
 from tensorflow.keras import activations
 import matplotlib.pyplot as plt
 import numpy as np
-from ActivationFunction import ActivationFunctionFactory
+from ActivationFunction import ActivationFunctionFactory, ApproximationType
 
-def compare_activations():
+output_dir = '/Users/matter/Downloads/activation_polynomial_approximations'
+
+def compare_activations() -> None:
+    """
+    Compare polynomial approximations of different activation functions.
+    Generates plots showing the original activation functions alongside their
+    polynomial approximations of varying degrees, including residual plots.
+    """
     activation_functions = [
         activations.sigmoid,
         activations.relu,
         activations.tanh,
-        # activations.softmax  # typically used for multi-class classification, and max is difficult in homomorphic encryption, so I'm skipping it
+        activations.gelu,
+        activations.selu,
+        activations.elu,
+        # activations.softmax  # typically used for multi-class classification, and max is difficult (if not impossible) in homomorphic encryption
     ]
     
-    degrees = np.arange(1, 20, 1)
+    degrees = np.arange(3, 20, 2)
     x_range = (-5, 5)
     num_points = 1000
 
-    
     # Create a subplot grid for all activation functions
     num_activations = len(activation_functions)
-    num_cols = 3  # Display 2 plots per row
+    num_cols = 3
     num_rows = (num_activations + num_cols - 1) // num_cols  # Ceiling division
     
     fig, axs = plt.subplots(num_rows, num_cols, figsize=(12, 5*num_rows))
-    axs = axs.flatten()  # Flatten the array of axes for easy indexing
-    
-    for idx, activation in enumerate(activation_functions):
-        factory = ActivationFunctionFactory(base_activation=activation)
-        fig = factory.compare_polynomial_approximations(degrees=degrees, x_range=x_range, num_points=num_points)
-        fig.canvas.draw()  # Ensure the figure is drawn
-        axs[idx].imshow(fig.canvas.buffer_rgba())  # Display the figure in the subplot
-        axs[idx].axis('off')  # Hide the axes for a cleaner look
-    
-    plt.tight_layout()
-    plt.show()
+    axs = axs.flatten()
+
+    for approximation_type in ApproximationType:
+        output_path = f'{output_dir}/activation_polynomial_approximations_{approximation_type.value}.pdf'
+        for idx, activation in enumerate(activation_functions):
+            factory = ActivationFunctionFactory(
+                base_activation=activation,
+                approximation_type=approximation_type
+            )
+            fig = factory.compare_polynomial_approximations(degrees=degrees, x_range=x_range, num_points=num_points, debug=True)
+            fig.canvas.draw()
+            axs[idx].imshow(fig.canvas.buffer_rgba())
+            axs[idx].axis('off')
+        
+        plt.tight_layout()
+        plt.savefig(output_path, dpi=300)
 
 if __name__ == "__main__":
     compare_activations()
