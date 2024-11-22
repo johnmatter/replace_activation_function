@@ -37,15 +37,18 @@ class ActivationFunction:
     Attributes:
         poly: A polynomial object with coefficients representing the approximation.
     """
-    def __init__(self, poly: object, description: str) -> None:
+    def __init__(self, poly: object, description: str, metrics: dict = None) -> None:
         """
         Initialize the activation function with a polynomial approximation.
         
         Args:
             poly: Object containing coefficients representing the polynomial approximation.
+            description: Description of the activation function.
+            metrics: Dictionary containing goodness of fit metrics (R², RMSE, etc.)
         """
         self.poly = poly
         self.description = description
+        self.metrics = metrics or {}
     
     def __call__(self, x: tf.Tensor) -> tf.Tensor:
         """
@@ -60,11 +63,13 @@ class ActivationFunction:
         x = tf.clip_by_value(x, -5.0, 5.0)
         return sum([c * K.pow(x, i) for i, c in enumerate(self.poly.coefficients)])
 
-    def dump(self) -> None:
-        # Print polynomial with lowest degree first, including placeholder variable x and degrees
-        polynomial_str = ' + '.join([f'{c} * x^{i}' for i, c in enumerate(self.poly.coefficients)])
+    def dump(self) -> str:
+        polynomial_str = ' + '.join([f'{c:.6e} * x^{i}' for i, c in enumerate(self.poly.coefficients)])
         dump_str = f'{self.description}: {polynomial_str}'
-        print(dump_str)
+        if self.metrics:
+            metrics_str = ', '.join([f'{k}: {v:.6f}' for k, v in self.metrics.items()])
+            dump_str += f'\nMetrics: {metrics_str}'
+        return dump_str
 
 class ActivationFunctionFactory:
     """
@@ -328,9 +333,57 @@ class ActivationFunctionFactory:
         
         return PolyWrapper(scaled_coeffs)
 
+    def _calculate_metrics(self, y_true: np.ndarray, y_pred: np.ndarray, n_params: int) -> dict:
+        """
+        Calculate goodness of fit metrics appropriate for polynomial approximations.
+        
+        Args:
+            y_true: True values
+            y_pred: Predicted values
+            n_params: Number of parameters (degree + 1)
+            
+        Returns:
+            Dictionary of metrics
+        """
+        n = len(y_true)
+        residuals = y_true - y_pred
+        rss = np.sum(residuals ** 2)
+        tss = np.sum((y_true - np.mean(y_true)) ** 2)
+        
+        # Adjusted R² to account for model complexity
+        r_squared = 1 - (rss / tss)
+        adj_r_squared = 1 - (1 - r_squared) * (n - 1) / (n - n_params - 1)
+        
+        # Scale-independent metrics
+        y_range = np.max(y_true) - np.min(y_true)
+        nrmse = np.sqrt(np.mean(residuals ** 2)) / y_range  # Normalized RMSE
+        
+        # Information criteria
+        aic = n * np.log(rss/n) + 2 * n_params
+        bic = n * np.log(rss/n) + n_params * np.log(n)
+        
+        return {
+            'Adj_R²': adj_r_squared,
+            'NRMSE': nrmse,
+            'AIC': aic,
+            'BIC': bic
+        }
+
     def create(self):
         poly = self._get_polynomial()
-        return ActivationFunction(poly, self.description)    
+        
+        # Calculate metrics
+        x = np.linspace(-5.0, 5.0, 1000)
+        if self.base_activation == activations.relu:
+            beta = 1.0
+            y_true = np.log(1 + np.exp(beta * x)) / beta
+        else:
+            y_true = self.base_activation(x).numpy()
+        
+        y_pred = sum([c * x**i for i, c in enumerate(poly.coefficients)])
+        metrics = self._calculate_metrics(y_true, y_pred, self.degree + 1)
+        
+        return ActivationFunction(poly, self.description, metrics)
 
     def compare_polynomial_approximations(
         self, 
@@ -338,7 +391,8 @@ class ActivationFunctionFactory:
         x_range: Tuple[float, float] = (-5,5), 
         num_points: int = 1000,
         log_scale: bool = False,
-        debug: bool = False
+        debug: bool = False,
+        summary_file: str = 'activation_approximation_summary.txt'
     ) -> plt.Figure:
         """
         Compare polynomial approximations of different degrees to the original activation function.
@@ -384,7 +438,9 @@ class ActivationFunctionFactory:
             )
             approx = factory.create()
             if debug:
-                approx.dump()
+                dump_str = approx.dump()
+                with open(f'activation_polynomial_approximation_{self.base_activation.__name__}_{self.approximation_type.value}_{degree}.txt', 'w') as f:
+                    f.write(dump_str)
             y_approx = approx(x)
             
             # Plot approximation
@@ -419,5 +475,29 @@ class ActivationFunctionFactory:
         
         plt.tight_layout()
         plt.close(fig)  # Close the figure to prevent display
+        
+        # Create summary table
+        summary = f"\nGoodness of Fit Summary for {self.description}:\n"
+        summary += "-" * 80 + "\n"
+        headers = ["Degree", "Adj_R²", "NRMSE", "AIC", "BIC"]
+        summary += f"{headers[0]:<8} {headers[1]:>12} {headers[2]:>12} {headers[3]:>12} {headers[4]:>12}\n"
+        summary += "-" * 80 + "\n"
+        
+        for degree in degrees:
+            factory = ActivationFunctionFactory(
+                base_activation=self.base_activation,
+                approximation_type=self.approximation_type,
+                degree=degree
+            )
+            approx = factory.create()
+            metrics = approx.metrics
+            summary += (f"{degree:<8} {metrics['Adj_R²']:>12.6f} {metrics['NRMSE']:>12.6f} "
+                       f"{metrics['AIC']:>12.1f} {metrics['BIC']:>12.1f}\n")
+        
+        summary += "-" * 80 + "\n\n"
+        
+        # Append to summary file
+        with open(summary_file, 'a') as f:
+            f.write(summary)
         
         return fig

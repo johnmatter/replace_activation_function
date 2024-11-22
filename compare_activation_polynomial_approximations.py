@@ -34,6 +34,12 @@ def compare_activations() -> None:
     fig, axs = plt.subplots(num_rows, num_cols, figsize=(12, 5*num_rows))
     axs = axs.flatten()
 
+    # Clear the summary file at the start
+    summary_file = 'activation_approximation_summary.txt'
+    with open(summary_file, 'w') as f:
+        f.write("Activation Function Approximation Summary\n")
+        f.write("======================================\n\n")
+    
     for approximation_type in ApproximationType:
         output_path = f'{output_dir}/activation_polynomial_approximations_{approximation_type.value}.pdf'
         for idx, activation in enumerate(activation_functions):
@@ -41,7 +47,13 @@ def compare_activations() -> None:
                 base_activation=activation,
                 approximation_type=approximation_type
             )
-            fig = factory.compare_polynomial_approximations(degrees=degrees, x_range=x_range, num_points=num_points, debug=True)
+            fig = factory.compare_polynomial_approximations(
+                degrees=degrees, 
+                x_range=x_range, 
+                num_points=num_points, 
+                debug=True,
+                summary_file=summary_file
+            )
             fig.canvas.draw()
             axs[idx].imshow(fig.canvas.buffer_rgba())
             axs[idx].axis('off')
