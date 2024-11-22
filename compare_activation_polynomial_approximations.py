@@ -19,7 +19,6 @@ def compare_activations() -> None:
         activations.gelu,
         activations.selu,
         activations.elu,
-        # activations.softmax  # typically used for multi-class classification, and max is difficult (if not impossible) in homomorphic encryption
     ]
     
     degrees = np.arange(3, 20, 2)
@@ -29,16 +28,10 @@ def compare_activations() -> None:
     # Create a subplot grid for all activation functions
     num_activations = len(activation_functions)
     num_cols = 3
-    num_rows = (num_activations + num_cols - 1) // num_cols  # Ceiling division
+    num_rows = (num_activations + num_cols - 1) // num_cols
     
     fig, axs = plt.subplots(num_rows, num_cols, figsize=(12, 5*num_rows))
     axs = axs.flatten()
-
-    # Clear the summary file at the start
-    summary_file = 'activation_approximation_summary.txt'
-    with open(summary_file, 'w') as f:
-        f.write("Activation Function Approximation Summary\n")
-        f.write("======================================\n\n")
     
     for approximation_type in ApproximationType:
         output_path = f'{output_dir}/activation_polynomial_approximations_{approximation_type.value}.pdf'
@@ -51,8 +44,7 @@ def compare_activations() -> None:
                 degrees=degrees, 
                 x_range=x_range, 
                 num_points=num_points, 
-                debug=True,
-                summary_file=summary_file
+                debug=True
             )
             fig.canvas.draw()
             axs[idx].imshow(fig.canvas.buffer_rgba())
@@ -60,6 +52,10 @@ def compare_activations() -> None:
         
         plt.tight_layout()
         plt.savefig(output_path, dpi=300)
+    
+    # Save metrics DataFrame to CSV
+    metrics_path = f'{output_dir}/activation_approximation_metrics.csv'
+    ActivationFunctionFactory.metrics_df.to_csv(metrics_path, index=False)
 
 if __name__ == "__main__":
     compare_activations()

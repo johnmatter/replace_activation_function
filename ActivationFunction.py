@@ -13,6 +13,7 @@ from scipy.linalg import lstsq
 from scipy.special import eval_legendre
 from scipy.integrate import fixed_quad
 import pdb
+import pandas as pd
 
 # For what it's worth, HEIR uses -0.004 * x^3 + 0.197 * x + 0.5 for sigmoid
 # See https://github.com/google/heir/blob/f9e39963b863490eaec81e53b4b9d180a4603874/lib/Dialect/TOSA/Conversions/TosaToSecretArith/TosaToSecretArith.cpp#L95-L100
@@ -75,6 +76,12 @@ class ActivationFunctionFactory:
     """
     Factory class for creating polynomial approximations of activation functions.
     """
+    # Class-level DataFrame to store all metrics
+    metrics_df = pd.DataFrame(columns=[
+        'activation_fn', 'approximation_type', 'degree',
+        'Adj_R²', 'NRMSE', 'AIC', 'BIC'
+    ])
+
     def __init__(
         self, 
         base_activation: Callable = activations.sigmoid, 
@@ -383,7 +390,46 @@ class ActivationFunctionFactory:
         y_pred = sum([c * x**i for i, c in enumerate(poly.coefficients)])
         metrics = self._calculate_metrics(y_true, y_pred, self.degree + 1)
         
+        # Add metrics to DataFrame
+        new_row = pd.DataFrame([{
+            'activation_fn': self.base_activation.__name__,
+            'approximation_type': self.approximation_type.value,
+            'degree': self.degree,
+            **metrics
+        }])
+        
+        # Use class-level DataFrame
+        ActivationFunctionFactory.metrics_df = pd.concat(
+            [ActivationFunctionFactory.metrics_df, new_row], 
+            ignore_index=True
+        )
+        
         return ActivationFunction(poly, self.description, metrics)
+
+    def get_metrics_summary(self) -> str:
+        """Generate a formatted summary string from the metrics DataFrame."""
+        if self.metrics_df.empty:
+            return "No metrics available."
+        
+        grouped = self.metrics_df.groupby(['activation_fn', 'approximation_type'])
+        
+        summary = "Activation Function Approximation Summary\n"
+        summary += "======================================\n\n"
+        
+        for (act_fn, approx_type), group in grouped:
+            summary += f"\nMetrics for {act_fn} ({approx_type}):\n"
+            summary += "-" * 80 + "\n"
+            headers = ["Degree", "Adj_R²", "NRMSE", "AIC", "BIC"]
+            summary += f"{headers[0]:<8} {headers[1]:>12} {headers[2]:>12} {headers[3]:>12} {headers[4]:>12}\n"
+            summary += "-" * 80 + "\n"
+            
+            for _, row in group.sort_values('degree').iterrows():
+                summary += (f"{row['degree']:<8} {row['Adj_R²']:>12.6f} {row['NRMSE']:>12.6f} "
+                          f"{row['AIC']:>12.1f} {row['BIC']:>12.1f}\n")
+            
+            summary += "-" * 80 + "\n"
+        
+        return summary
 
     def compare_polynomial_approximations(
         self, 
@@ -392,7 +438,6 @@ class ActivationFunctionFactory:
         num_points: int = 1000,
         log_scale: bool = False,
         debug: bool = False,
-        summary_file: str = 'activation_approximation_summary.txt'
     ) -> plt.Figure:
         """
         Compare polynomial approximations of different degrees to the original activation function.
@@ -401,6 +446,8 @@ class ActivationFunctionFactory:
             degrees: List of polynomial degrees to compare.
             x_range: Tuple of (min, max) x values for evaluation.
             num_points: Number of points to evaluate functions at.
+            log_scale: Whether to use logarithmic scale for plots.
+            debug: Whether to print debug information.
         
         Returns:
             matplotlib Figure containing the comparison plots.
@@ -416,7 +463,6 @@ class ActivationFunctionFactory:
         # Create a new figure with two subplots
         fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 12), height_ratios=[2, 1])
         
-        # Set y-axis to logarithmic scale for main plot
         if log_scale:
             ax1.set_yscale('log')
         
@@ -427,7 +473,19 @@ class ActivationFunctionFactory:
             else:
                 y_true = self.base_activation(x)
             
+            # Get y-axis limits from true activation function
+            y_min = tf.reduce_min(y_true).numpy()
+            y_max = tf.reduce_max(y_true).numpy()
+            
+            # Add some padding (10% of range)
+            y_padding = 0.1 * (y_max - y_min)
+            y_min -= y_padding
+            y_max += y_padding
+            
             ax1.plot(x, y_true, 'k-', label='Original', linewidth=2)
+            
+            # Set y-axis limits
+            ax1.set_ylim(y_min, y_max)
         
         # Plot approximations and residuals
         for i, degree in enumerate(degrees):
@@ -438,9 +496,11 @@ class ActivationFunctionFactory:
             )
             approx = factory.create()
             if debug:
-                dump_str = approx.dump()
-                with open(f'activation_polynomial_approximation_{self.base_activation.__name__}_{self.approximation_type.value}_{degree}.txt', 'w') as f:
-                    f.write(dump_str)
+                print(f"Debug info for {self.base_activation.__name__} "
+                      f"(degree {degree}, {self.approximation_type.value}):")
+                print(approx.dump())
+                print()
+            
             y_approx = approx(x)
             
             # Plot approximation
@@ -468,36 +528,12 @@ class ActivationFunctionFactory:
         # Configure residuals plot
         ax2.grid(True, alpha=0.3)
         if log_scale:
-            ax2.set_yscale('log')  # Log scale for residuals too
+            ax2.set_yscale('log')
         ax2.set_title('Absolute Residuals')
         ax2.set_xlabel('x')
         ax2.set_ylabel('|y_true - y_approx|')
         
         plt.tight_layout()
         plt.close(fig)  # Close the figure to prevent display
-        
-        # Create summary table
-        summary = f"\nGoodness of Fit Summary for {self.description}:\n"
-        summary += "-" * 80 + "\n"
-        headers = ["Degree", "Adj_R²", "NRMSE", "AIC", "BIC"]
-        summary += f"{headers[0]:<8} {headers[1]:>12} {headers[2]:>12} {headers[3]:>12} {headers[4]:>12}\n"
-        summary += "-" * 80 + "\n"
-        
-        for degree in degrees:
-            factory = ActivationFunctionFactory(
-                base_activation=self.base_activation,
-                approximation_type=self.approximation_type,
-                degree=degree
-            )
-            approx = factory.create()
-            metrics = approx.metrics
-            summary += (f"{degree:<8} {metrics['Adj_R²']:>12.6f} {metrics['NRMSE']:>12.6f} "
-                       f"{metrics['AIC']:>12.1f} {metrics['BIC']:>12.1f}\n")
-        
-        summary += "-" * 80 + "\n\n"
-        
-        # Append to summary file
-        with open(summary_file, 'a') as f:
-            f.write(summary)
         
         return fig
