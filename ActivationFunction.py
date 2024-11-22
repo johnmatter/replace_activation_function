@@ -4,26 +4,90 @@ from scipy.interpolate import approximate_taylor_polynomial
 from tensorflow.keras import backend as K
 import numpy as np
 import matplotlib.pyplot as plt
+from enum import Enum
+import numpy.polynomial.chebyshev as chebyshev
+from typing import List, Union, Callable, Tuple, Optional
 
 # For what it's worth, HEIR uses -0.004 * x^3 + 0.197 * x + 0.5 for sigmoid
 # See https://github.com/google/heir/blob/f9e39963b863490eaec81e53b4b9d180a4603874/lib/Dialect/TOSA/Conversions/TosaToSecretArith/TosaToSecretArith.cpp#L95-L100
 
-class ActivationFunction:
-    def __init__(self, poly):
-        self.poly = poly
+class ApproximationType(Enum):
+    """Enum for different types of polynomial approximations."""
+    TAYLOR = "taylor"
+    CHEBYSHEV = "chebyshev"
 
-    def __call__(self, x):
+class ActivationFunction:
+    """
+    A class representing an activation function approximated by a polynomial.
+    
+    Attributes:
+        poly: A polynomial object with coefficients representing the approximation.
+    """
+    def __init__(self, poly: object) -> None:
+        """
+        Initialize the activation function with a polynomial approximation.
+        
+        Args:
+            poly: Object containing coefficients representing the polynomial approximation.
+        """
+        self.poly = poly
+    
+    def __call__(self, x: tf.Tensor) -> tf.Tensor:
+        """
+        Apply the polynomial approximation to the input tensor.
+        
+        Args:
+            x: Input tensor to apply the activation function to.
+            
+        Returns:
+            Tensor with the activation function applied.
+        """
         x = tf.clip_by_value(x, -5.0, 5.0)
         return sum([c * K.pow(x, i) for i, c in enumerate(self.poly.coefficients)])
 
 class ActivationFunctionFactory:
-    def __init__(self, base_activation=activations.sigmoid, degree=3):
+    """
+    Factory class for creating polynomial approximations of activation functions.
+    """
+    def __init__(
+        self, 
+        base_activation: Callable = activations.sigmoid, 
+        degree: int = 3, 
+        approximation_type: ApproximationType = ApproximationType.CHEBYSHEV
+    ) -> None:
+        """
+        Initialize the factory with parameters for polynomial approximation.
+        
+        Args:
+            base_activation: The activation function to approximate.
+            degree: Maximum degree of the polynomial approximation.
+            approximation_type: Type of polynomial approximation to use.
+        """
         self.base_activation = base_activation
         self.degree = degree
-
-    def _get_polynomial(self):
+        self.approximation_type = approximation_type
+    
+    def _get_polynomial(self) -> object:
+        """
+        Get the polynomial approximation based on the specified type.
+        
+        Returns:
+            A polynomial object with coefficients.
+        """
+        match self.approximation_type:
+            case ApproximationType.TAYLOR:
+                return self._get_taylor_polynomial()
+            case ApproximationType.CHEBYSHEV:
+                return self._get_chebyshev_polynomial()
+    
+    def _get_taylor_polynomial(self) -> object:
+        """
+        Compute Taylor series approximation of the activation function.
+        
+        Returns:
+            Taylor series approximation object.
+        """
         if self.base_activation == activations.relu:
-            # Use softplus as a smooth approximation of ReLU
             beta = 1.0
             return approximate_taylor_polynomial(
                 lambda x: K.log(1 + K.exp(beta * x)) / beta,
@@ -31,14 +95,6 @@ class ActivationFunctionFactory:
                 degree=self.degree,
                 scale=1.0
             )
-        elif self.base_activation == activations.sigmoid:
-            return approximate_taylor_polynomial(
-                self.base_activation, 
-                0, 
-                degree=self.degree, 
-                scale=1.0
-            )
-        # Add more activation functions here
         else:
             return approximate_taylor_polynomial(
                 self.base_activation, 
@@ -46,13 +102,54 @@ class ActivationFunctionFactory:
                 degree=self.degree, 
                 scale=1.0
             )
+    
+    def _get_chebyshev_polynomial(self) -> object:
+        """
+        Compute Chebyshev polynomial approximation of the activation function.
+        
+        Returns:
+            Chebyshev polynomial approximation object.
+        """
+        x_range = [-5.0, 5.0]
+        num_points = 1000
+        x = np.linspace(x_range[0], x_range[1], num_points)
+        
+        if self.base_activation == activations.relu:
+            beta = 1.0
+            y = np.log(1 + np.exp(beta * x)) / beta
+        else:
+            y = self.base_activation(x).numpy()
+        
+        coeffs = chebyshev.chebfit(x, y, self.degree)
+        power_series = chebyshev.cheb2poly(coeffs)
+        
+        class PolyWrapper:
+            def __init__(self, coefficients: np.ndarray) -> None:
+                self.coefficients = coefficients
+        
+        return PolyWrapper(power_series)
 
     def create(self):
         poly = self._get_polynomial()
         return ActivationFunction(poly)    
 
-    def compare_polynomial_approximations(self, degrees=[1,2,3,4,5], x_range=(-5,5), num_points=1000):
-        """Compare polynomial approximations of different degrees to the original activation function."""
+    def compare_polynomial_approximations(
+        self, 
+        degrees: List[int] = [1,2,3,4,5], 
+        x_range: Tuple[float, float] = (-5,5), 
+        num_points: int = 1000
+    ) -> plt.Figure:
+        """
+        Compare polynomial approximations of different degrees to the original activation function.
+        
+        Args:
+            degrees: List of polynomial degrees to compare.
+            x_range: Tuple of (min, max) x values for evaluation.
+            num_points: Number of points to evaluate functions at.
+        
+        Returns:
+            matplotlib Figure containing the comparison plots.
+        """
         # Create color scheme using viridis colormap
         num_colors = len(degrees)
         colors = plt.cm.viridis(np.linspace(0, 1, num_colors))
