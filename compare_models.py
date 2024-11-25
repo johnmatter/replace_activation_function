@@ -30,15 +30,21 @@ def compare_predictions(original_preds, modified_preds):
     print(f"{'Class':30} {'Original':>10} {'Modified':>10}")
     print("-" * 50)
 
-    # Get the pre-sorted top k predictions
-    orig_probs = original_preds['top_k_probabilities'][0]
-    mod_probs = modified_preds['top_k_probabilities'][0]
+    # Get the original model's top k predictions and labels
     orig_labels = original_preds['top_k_labels'][0]
-    mod_labels = modified_preds['top_k_labels'][0]
+    orig_probs = original_preds['top_k_probabilities'][0]
     
-    # Print top k predictions for both models
-    for i in range(len(orig_labels)):
-        print(f"{orig_labels[i]:30} {orig_probs[i]:10.4f} {mod_probs[i]:10.4f}")
+    # Get all probabilities from modified model
+    mod_all_labels_dict = modified_preds['all_labels_dict']
+    
+    # For each top prediction from original model, get corresponding probability from modified model
+    for i, label in enumerate(orig_labels):
+        # Get original probability
+        orig_prob = orig_probs[i]
+        # Get corresponding probability from modified model
+        mod_prob = mod_all_labels_dict.get(label, 0.0)
+        
+        print(f"{label:30} {orig_prob:10.4f} {mod_prob:10.4f}")
 
 def main():
     # ----------------------------------------------------------------
@@ -72,15 +78,18 @@ def main():
     
     # Create activation function approximation
     factory = ActivationFunctionFactory(
-        base_activation=activations.sigmoid,
-        degree=3,
+        base_activation=activations.relu,
+        degree=25,
         approximation_type=ApproximationType.CHEBYSHEV
     )
     chebyshev_activation = factory.create()
     
     # Split and replace activation layers
     modified_model.model = modified_model.split_activation_layers()
-    modified_model.replace_activations(chebyshev_activation)
+    modified_model.replace_activations(activations.relu, chebyshev_activation)
+
+    # Compile the modified model
+    modified_model.model.compile()
     
     # ----------------------------------------------------------------
     # Get predictions from original model
@@ -94,6 +103,7 @@ def main():
     # ----------------------------------------------------------------
     # Compare results
     compare_predictions(original_preds, modified_preds)
+    compare_predictions(modified_preds, original_preds)
 
     # Display the test image
     plt.figure(figsize=(8, 8))

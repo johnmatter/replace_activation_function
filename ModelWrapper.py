@@ -133,6 +133,17 @@ class ModelWrapper:
                             config['activation'] != 'linear')
             
             if has_activation:
+                # Here's the general idea:
+                # 1. Replace the layer's activation with a linear activation.
+                # 2. Add a new activation layer to the model with our polynomial approximation for the activation function.
+                # This is equivalent to replacing the activation function with a polynomial approximation. Consider, for example a layer with ReLU activation:
+                #    output = relu(W*x+b)
+                # becomes
+                #    temp = linear(W*x+b) = W*x+b
+                #    output = poly(temp) = poly(W*x+b) = a0 + a1*(W*x+b) + a2*(W*x+b)^2 + ...
+                # which is equivalent to:
+                #    output = poly(W*x+b) = a0 + a1*(W*x+b) + a2*(W*x+b)^2 + ...
+
                 # Store the activation type
                 activation_type = config['activation']
                 # Remove activation from layer
@@ -212,25 +223,28 @@ class ModelWrapper:
         
         return new_model
         
-    def replace_activations(self, activation_function: Callable) -> 'ModelWrapper':
+    def replace_activations(self, original_activation_function: Callable, replacement_activation_function: Callable) -> 'ModelWrapper':
         replacements_made = 0
+        skipped_replacements = 0
         for layer in self.model.layers:
             if isinstance(layer, tf.keras.layers.Activation):
-                # Replace sigmoid activations
-                if layer.activation == tf.keras.activations.sigmoid:  
-                    layer.activation = activation_function
+                if layer.activation.__name__ == original_activation_function.__name__:   
+                    print(f"Replacing activation {original_activation_function.__name__} with {replacement_activation_function.poly.dump()}")
+                    layer.activation = replacement_activation_function
                     replacements_made += 1
-                # Keep ReLU as is
-                elif layer.activation == tf.keras.activations.relu:   
-                    continue
-                # Keep other activations as is
                 else:
-                    continue
+                    # print(f"Skipping layer {layer.name} with activation {layer.activation.__name__}")
+                    skipped_replacements += 1
         
         if replacements_made == 0:
             print("Warning: No activation functions were replaced!")
         else:
             print(f"Replaced {replacements_made} activation functions")
+
+        # # Print the activations of the modified model
+        # for layer in self.model.layers:
+        #     if isinstance(layer, tf.keras.layers.Activation):
+        #         print(f"Layer {layer.name} has activation: {layer.activation.__class__.__name__}")
         
         return self
 
@@ -263,7 +277,7 @@ class ModelWrapper:
             'is_huggingface': self.is_huggingface,
             'model_type': self.model_type,
             'model_name': self.model_name,
-            'top_k': 5
+            'top_k': 10 
         }
         
         # Add HuggingFace specific info if needed

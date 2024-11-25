@@ -14,6 +14,7 @@ from scipy.special import eval_legendre
 from scipy.integrate import fixed_quad
 import pdb
 import pandas as pd
+import warnings
 
 # For what it's worth, HEIR uses -0.004 * x^3 + 0.197 * x + 0.5 for sigmoid
 # See https://github.com/google/heir/blob/f9e39963b863490eaec81e53b4b9d180a4603874/lib/Dialect/TOSA/Conversions/TosaToSecretArith/TosaToSecretArith.cpp#L95-L100
@@ -21,6 +22,9 @@ import pandas as pd
 class PolyWrapper:
     def __init__(self, coefficients: np.ndarray) -> None:
         self.coefficients = coefficients
+    def dump(self):
+        polynomial_str = ' + '.join([f'{c:.6e} * x^{i}' for i, c in enumerate(self.coefficients)])
+        return f'{polynomial_str}'
 
 class ApproximationType(Enum):
     """Enum for different types of polynomial approximations."""
@@ -38,7 +42,7 @@ class ActivationFunction:
     Attributes:
         poly: A polynomial object with coefficients representing the approximation.
     """
-    def __init__(self, poly: object, description: str, metrics: dict = None) -> None:
+    def __init__(self, poly: object, base_activation: object, description: str, metrics: dict = None) -> None:
         """
         Initialize the activation function with a polynomial approximation.
         
@@ -49,24 +53,46 @@ class ActivationFunction:
         """
         self.poly = poly
         self.description = description
+        self.base_activation = base_activation
         self.metrics = metrics or {}
     
-    def __call__(self, x: tf.Tensor) -> tf.Tensor:
+    @tf.function
+    def __call__(self, x: tf.Tensor, training=None) -> tf.Tensor:
         """
         Apply the polynomial approximation to the input tensor.
         
         Args:
             x: Input tensor to apply the activation function to.
+            training: Unused, but kept for API consistency with Keras
             
         Returns:
             Tensor with the activation function applied.
         """
+        x = tf.convert_to_tensor(x)
         x = tf.clip_by_value(x, -5.0, 5.0)
-        return sum([c * K.pow(x, i) for i, c in enumerate(self.poly.coefficients)])
+        
+        # Use tf.nest.map_structure to handle different tensor types
+        def apply_poly(t):
+            return sum([c * tf.pow(t, i) for i, c in enumerate(self.poly.coefficients)])
+            
+        return tf.nest.map_structure(apply_poly, x)
+    
+    def get_config(self) -> dict:
+        """Return configuration of the activation function."""
+        return {
+            'coefficients': self.poly.coefficients.tolist(),
+            'description': self.description,
+            'metrics': self.metrics
+        }
+    
+    @classmethod
+    def from_config(cls, config):
+        """Create activation function from configuration."""
+        poly = PolyWrapper(np.array(config['coefficients']))
+        return cls(poly, config['base_activation'], config['description'], config['metrics'])
 
     def dump(self) -> str:
-        polynomial_str = ' + '.join([f'{c:.6e} * x^{i}' for i, c in enumerate(self.poly.coefficients)])
-        dump_str = f'{self.description}: {polynomial_str}'
+        dump_str = f'{self.description}: {self.poly.dump()}'
         if self.metrics:
             metrics_str = ', '.join([f'{k}: {v:.6f}' for k, v in self.metrics.items()])
             dump_str += f'\nMetrics: {metrics_str}'
@@ -76,15 +102,9 @@ class ActivationFunctionFactory:
     """
     Factory class for creating polynomial approximations of activation functions.
     """
-    # Class-level DataFrame to store all metrics
-    metrics_df = pd.DataFrame(columns=[
-        'activation_fn', 'approximation_type', 'degree',
-        'Adj_R²', 'NRMSE', 'AIC', 'BIC'
-    ])
-
     def __init__(
         self, 
-        base_activation: Callable = activations.sigmoid, 
+        base_activation: object, 
         degree: int = 3, 
         approximation_type: ApproximationType = ApproximationType.CHEBYSHEV,
         description: str = None,
@@ -104,6 +124,15 @@ class ActivationFunctionFactory:
         self.approximation_type = approximation_type
         self.description = description if description else self._get_description()
         self.debug = debug
+        self.metrics_df = pd.DataFrame(columns=[
+            'activation_fn', 'approximation_type', 'degree',
+            'Adj_R²', 'NRMSE', 'AIC', 'BIC', 'metadata'
+        ])
+        self.run_metadata = {
+            'timestamp': pd.Timestamp.now().isoformat(),
+            'x_range': [-5.0, 5.0],
+            'num_points': 1000
+        }
 
     def _get_description(self) -> str:
         """
@@ -395,16 +424,13 @@ class ActivationFunctionFactory:
             'activation_fn': self.base_activation.__name__,
             'approximation_type': self.approximation_type.value,
             'degree': self.degree,
+            'metadata': self.run_metadata,
             **metrics
         }])
         
-        # Use class-level DataFrame
-        ActivationFunctionFactory.metrics_df = pd.concat(
-            [ActivationFunctionFactory.metrics_df, new_row], 
-            ignore_index=True
-        )
+        self.metrics_df = pd.concat([self.metrics_df, new_row], ignore_index=True)
         
-        return ActivationFunction(poly, self.description, metrics)
+        return ActivationFunction(poly, self.base_activation, self.description, metrics)
 
     def get_metrics_summary(self) -> str:
         """Generate a formatted summary string from the metrics DataFrame."""
@@ -430,6 +456,21 @@ class ActivationFunctionFactory:
             summary += "-" * 80 + "\n"
         
         return summary
+
+    def plot_metrics(self) -> plt.Figure:
+        """Plot the metrics DataFrame with subplots for each metric."""
+        fig, axs = plt.subplots(1, 4, figsize=(20, 5))
+        metrics_to_plot = ['Adj_R²', 'AIC', 'BIC', 'NRMSE']
+        for i, metric in enumerate(metrics_to_plot):
+            for act_fn in self.metrics_df['activation_fn'].unique():
+                df_filtered = self.metrics_df[self.metrics_df['activation_fn'] == act_fn]
+                axs[i].plot(df_filtered['degree'], df_filtered[metric], label=act_fn)
+            axs[i].set_title(metric)
+            axs[i].set_xlabel('Degree')
+            axs[i].set_ylabel(metric)
+            axs[i].legend()
+        plt.tight_layout()
+        return fig
 
     def compare_polynomial_approximations(
         self, 
@@ -489,12 +530,8 @@ class ActivationFunctionFactory:
         
         # Plot approximations and residuals
         for i, degree in enumerate(degrees):
-            factory = ActivationFunctionFactory(
-                base_activation=self.base_activation,
-                approximation_type=self.approximation_type,
-                degree=degree
-            )
-            approx = factory.create()
+            self.degree = degree
+            approx = self.create()
             if debug:
                 print(f"Debug info for {self.base_activation.__name__} "
                       f"(degree {degree}, {self.approximation_type.value}):")
