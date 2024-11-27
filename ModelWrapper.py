@@ -1,3 +1,4 @@
+from enum import Enum
 from typing import Any, Dict, List, Union, Optional, Callable
 import numpy as np
 import tensorflow as tf
@@ -23,6 +24,12 @@ from PredictionDecoder import PredictionDecoder
 # - Xception
 # - ConvNeXtTiny, ConvNeXtSmall, ConvNeXtBase, ConvNeXtLarge
 
+class RetrainType(Enum):
+    """Enum for different types of retraining"""
+    ALL = "all"
+    BATCHED = "batched"
+    ITERATIVE = "iterative"
+
 class ModelWrapper:
     def __init__(
         self, 
@@ -41,12 +48,14 @@ class ModelWrapper:
         self.model_class = model_class
         self.processor_class = processor_class
         self.is_huggingface = is_huggingface
+
         self.initialize_debug()
 
     def initialize_debug(self) -> None:
         if self.debug is None:
             self.debug = {
                 'print_network_split_debug': False,
+                'print_activation_replacement_debug': True
             }
         
     def create_base_model(self) -> 'ModelWrapper':
@@ -223,17 +232,17 @@ class ModelWrapper:
         
         return new_model
         
-    def replace_activations(self, original_activation_function: Callable, replacement_activation_function: Callable) -> 'ModelWrapper':
+    def replace_all_activations(self, original_activation_function: Callable, replacement_activation_function: Callable) -> 'ModelWrapper':
         replacements_made = 0
         skipped_replacements = 0
         for layer in self.model.layers:
             if isinstance(layer, tf.keras.layers.Activation):
                 if layer.activation.__name__ == original_activation_function.__name__:   
-                    print(f"Replacing activation {original_activation_function.__name__} with {replacement_activation_function.poly.dump()}")
+                    if self.debug['print_activation_replacement_debug']:
+                        print(f"Replacing activation {original_activation_function.__name__} with {replacement_activation_function.poly.dump()}")
                     layer.activation = replacement_activation_function
                     replacements_made += 1
                 else:
-                    # print(f"Skipping layer {layer.name} with activation {layer.activation.__name__}")
                     skipped_replacements += 1
         
         if replacements_made == 0:
@@ -241,12 +250,18 @@ class ModelWrapper:
         else:
             print(f"Replaced {replacements_made} activation functions")
 
-        # # Print the activations of the modified model
-        # for layer in self.model.layers:
-        #     if isinstance(layer, tf.keras.layers.Activation):
-        #         print(f"Layer {layer.name} has activation: {layer.activation.__class__.__name__}")
-        
         return self
+
+    def replace_activation(self, layer: tf.keras.layers.Activation, replacement_activation_function: Callable) -> 'ModelWrapper':
+        if layer.activation.__name__ == replacement_activation_function.base_activation.__name__:   
+            if self.debug['print_activation_replacement_debug']:
+                print(f"Replacing activation {replacement_activation_function.base_activation.__name__} with {replacement_activation_function.poly.dump()}")
+            layer.activation = replacement_activation_function
+            return self
+        else:
+            if self.debug['print_activation_replacement_debug']:
+                print(f"Skipping layer {layer.name} with activation {layer.activation.__name__}")
+            return self
 
     def preprocess(self, inputs):
         if self.is_huggingface:
@@ -286,3 +301,85 @@ class ModelWrapper:
         
         # Use PredictionDecoder to handle the outputs
         return PredictionDecoder.decode(outputs, model_info)
+
+    def get_activation_layers(self, activation_type: Optional[str] = None) -> List[tf.keras.layers.Layer]:
+        """Get the activation layers"""
+        if activation_type is None:
+            return [layer for layer in self.model.layers if isinstance(layer, tf.keras.layers.Activation)]
+        return [layer for layer in self.model.layers if isinstance(layer, tf.keras.layers.Activation) and layer.activation.__name__ == activation_type]
+
+    def make_layers_trainable(self, trainable_layers: List[tf.keras.layers.Layer]) -> 'ModelWrapper':
+        """Make the specified layers trainable. All other layers will be non-trainable."""
+        for layer in self.model.layers:
+            if layer not in trainable_layers:
+                layer.trainable = False
+            else:
+                layer.trainable = True
+        return self
+
+    def get_trainable_layers(self) -> List[tf.keras.layers.Layer]:
+        """Get the trainable layers"""
+        return [layer for layer in self.model.layers if layer.trainable]
+
+    def get_non_trainable_layers(self) -> List[tf.keras.layers.Layer]:
+        """Get the non-trainable layers"""
+        return [layer for layer in self.model.layers if not layer.trainable]
+
+    def get_layer_before(self, layer: tf.keras.layers.Layer) -> tf.keras.layers.Layer:
+        """Get the layer before the specified layer"""
+        return self.model.layers[self.model.layers.index(layer) - 1]    
+
+    def add_layer_before(self, layer: tf.keras.layers.Layer, new_layer: tf.keras.layers.Layer) -> 'ModelWrapper':
+        """Add a layer before the specified layer"""
+        self.model.layers.insert(self.model.layers.index(layer), new_layer)
+        return self
+
+    def batch_renormalize_before_activation(self, activation_layer: tf.keras.layers.Activation) -> 'ModelWrapper':
+        """Batch normalize the layer before the specified activation layer"""
+        layer_before = self.get_layer_before(activation_layer)
+        layer_before.add_before(tf.keras.layers.BatchNormalization())
+        return self
+
+    def retrain(self, train_data: np.ndarray, train_labels: np.ndarray, retrain_type: RetrainType = RetrainType.ITERATIVE) -> 'ModelWrapper':
+        """Retrain the model"""
+        self.model.compile(
+            optimizer=tf.keras.optimizers.Adam(learning_rate=0.001),
+            loss=tf.keras.losses.CategoricalCrossentropy(),
+            metrics=['accuracy']
+        )
+        if retrain_type == RetrainType.ITERATIVE:
+            self._retrain_iterative(train_data, train_labels)
+        elif retrain_type == RetrainType.ALL:
+            self._retrain_all(train_data, train_labels)
+        elif retrain_type == RetrainType.BATCHED:
+            self._retrain_batched(train_data, train_labels, batch_size=10)
+        return self
+
+    def _retrain_iterative(self, train_data: np.ndarray, train_labels: np.ndarray) -> 'ModelWrapper':
+        """Retrain the model iteratively on each activation layer"""
+        for activation_layer in self.get_activation_layers():
+            self.replace_activation(activation_layer, activation_layer.activation)
+            self.model.fit(train_data, train_labels, epochs=10)
+        return self
+
+    def _retrain_all(self, train_data: np.ndarray, train_labels: np.ndarray) -> 'ModelWrapper':
+        """Retrain the model on all activation layers"""
+        self.model.fit(train_data, train_labels, epochs=10)
+        return self
+
+    def _retrain_batched(self, train_data: np.ndarray, train_labels: np.ndarray, batch_size: int = 10) -> 'ModelWrapper':
+        """Retrain the model in batches of activation layers"""
+        activation_layers = self.get_activation_layers()
+        for i in range(0, len(activation_layers), batch_size):
+            batch = activation_layers[i:i+batch_size]
+            for activation_layer in batch:
+                self.replace_activation(activation_layer, activation_layer.activation)
+            self.model.fit(train_data, train_labels, epochs=10)
+        return self
+
+    def replace_activation_and_retrain(self, original_activation_function: Callable, replacement_activation_function: Callable, train_data: np.ndarray, train_labels: np.ndarray) -> 'ModelWrapper':
+        """Replace the specified activation function and retrain the model"""
+        for activation_layer in self.get_activation_layers(original_activation_function.__name__):
+            self.replace_activation(activation_layer, replacement_activation_function)
+            self.retrain(train_data, train_labels)
+        return self

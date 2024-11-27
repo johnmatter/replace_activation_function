@@ -67,32 +67,23 @@ class PredictionDecoder:
             # Get the appropriate decode_predictions function
             keras_decode_predictions = self._get_keras_decoder(model_info.get('model_name'))
             
-            # Use keras_decode_predictions for ImageNet models
+            # Decode predictions
             decoded_predictions = keras_decode_predictions(predictions.numpy(), top=top_k)
             
-            # Get all class labels from the first prediction batch
-            all_class_indices = range(len(predictions[0]))
-            all_predictions = keras_decode_predictions(predictions.numpy(), top=len(predictions[0]))
-            
-            # Format the results consistently
+            # Format the results
             batch_labels = []
             batch_probs = []
-            all_labels = []
             for batch_preds in decoded_predictions:
                 labels = [pred[1] for pred in batch_preds]
                 probs = [pred[2] for pred in batch_preds]
                 batch_labels.append(labels)
                 batch_probs.append(probs)
             
-            # Include all labels and probabilities
-            all_labels_dict = {pred[1]: pred[2] for pred in all_predictions[0]}
-            
             return {
                 'probabilities': predictions.numpy(),
                 'predicted_labels': batch_labels,
                 'top_k_probabilities': np.array(batch_probs),
-                'top_k_labels': batch_labels,
-                'all_labels_dict': all_labels_dict
+                'top_k_labels': batch_labels
             }
         else:
             raise ValueError(f"Unsupported Keras model type: {model_info['model_type']}")

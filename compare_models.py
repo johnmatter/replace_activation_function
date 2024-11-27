@@ -9,6 +9,7 @@ from io import BytesIO
 import numpy as np
 
 from ModelWrapper import ModelWrapper
+from tiny_imagenet import TinyImagenetLoader
 from ActivationFunction import (
     ActivationFunction, 
     ActivationFunctionFactory, 
@@ -48,7 +49,7 @@ def compare_predictions(original_preds, modified_preds):
 
 def main():
     # ----------------------------------------------------------------
-    # Test image
+    # Load test image
     image_url = "https://images.pexels.com/photos/104827/cat-pet-animal-domestic-104827.jpeg"
     image = load_image_from_url(image_url)
 
@@ -76,18 +77,40 @@ def main():
     )
     modified_model.create_base_model()
     
+    # ----------------------------------------------------------------
     # Create activation function approximation
     factory = ActivationFunctionFactory(
         base_activation=activations.relu,
-        degree=25,
+        degree=55,
         approximation_type=ApproximationType.CHEBYSHEV
     )
     chebyshev_activation = factory.create()
     
-    # Split and replace activation layers
+    # ----------------------------------------------------------------
+    # Split and replace all activation layers
     modified_model.model = modified_model.split_activation_layers()
-    modified_model.replace_activations(activations.relu, chebyshev_activation)
+    # modified_model.replace_all_activations(activations.relu, chebyshev_activation)
+    
+    # Replace only the last ReLU activation layer
+    relu_layers = [layer for layer in modified_model.model.layers if isinstance(layer, tf.keras.layers.Activation) and layer.activation.__name__ == "relu"]
+    modified_model.replace_activation(relu_layers[-1], chebyshev_activation)
 
+    # ----------------------------------------------------------------
+    # Load training data using TinyImagenetLoader
+    train_data, val_data, _ = TinyImagenetLoader.load_tiny_imagenet(root_dir="data/tiny-imagenet-200")
+    train_images = train_data['images']
+    train_labels = train_data['labels']
+    val_images = val_data['images']
+    val_labels = val_data['labels']
+    
+    # Retrain the modified model using the iterative method
+    modified_model.retrain(train_images, train_labels)
+
+    # Check accuracy on validation set
+    val_acc = modified_model.model.evaluate(val_images, val_labels)[1]
+    print(f"Validation accuracy: {val_acc:.4f}")
+
+    # ----------------------------------------------------------------
     # Compile the modified model
     modified_model.model.compile()
     
