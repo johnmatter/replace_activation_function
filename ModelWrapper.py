@@ -1,7 +1,12 @@
 from enum import Enum
-from typing import Any, Dict, List, Union, Optional, Callable
+from typing import Any, Dict, List, Union, Optional, Callable, Tuple
+import json
+import os
+from enum import Enum
+from typing import Any, Dict, List, Union, Optional, Callable, Tuple
 import numpy as np
 import tensorflow as tf
+import warnings
 from transformers import (
     AutoModelForSequenceClassification, 
     AutoTokenizer,
@@ -38,18 +43,27 @@ class ModelWrapper:
         debug: Dict[str, bool] = None, 
         model_class: Optional[Any] = None, 
         processor_class: Optional[Any] = None, 
-        is_huggingface: bool = True
+        is_huggingface: bool = True,
+        input_shape: Tuple[int, int, int] = (224, 224, 3),
+        config_path: Optional[str] = None
     ) -> None:
         self.model_name = model_name
         self.model_type = model_type
         self.debug = debug
         self.model = None
         self.processor = None
+        self.activation_function = None
         self.model_class = model_class
         self.processor_class = processor_class
         self.is_huggingface = is_huggingface
+        self.input_shape = input_shape
+        self.config = self._load_config(config_path)
 
         self.initialize_debug()
+
+    def save(self, model_path: str) -> None:
+        """Save the model"""
+        self.model.save(model_path)
 
     def initialize_debug(self) -> None:
         if self.debug is None:
@@ -57,6 +71,50 @@ class ModelWrapper:
                 'print_network_split_debug': False,
                 'print_activation_replacement_debug': True
             }
+    
+    def _load_config(self, config_path: Optional[str] = None) -> Dict:
+        """Load configuration from JSON file"""
+        default_path = os.path.join(os.path.dirname(__file__), 'training_config.json')
+        config_path = config_path or default_path
+        
+        try:
+            with open(config_path, 'r') as f:
+                return json.load(f)
+        except FileNotFoundError:
+            # Return default config if file not found
+            warnings.warn(f"Config file not found at {config_path}.")
+            config = {
+                "training": {
+                    "epochs": 10,
+                    "batch_size": 32,
+                    "learning_rate": 0.001,
+                    "optimizer": "adam",
+                    "loss": "categorical_crossentropy",
+                    "metrics": ["accuracy"],
+                    "validation_split": 0.2
+                },
+                "retraining": {
+                    "batch_mode": {
+                        "batch_size": 10,
+                        "epochs": 10
+                    },
+                    "iterative_mode": {
+                        "epochs": 10
+                    },
+                    "all_mode": {
+                        "epochs": 10
+                    }
+                },
+                "prediction_decoder": {
+                    "top_k": None
+                }
+            }
+            print(f"Using default config: {config}")
+            return config
+    
+    def set_activation_function(self, activation_function: Callable) -> 'ModelWrapper':
+        self.activation_function = activation_function
+        return self
         
     def create_base_model(self) -> 'ModelWrapper':
         """Initialize the model and processor based on model type"""
@@ -72,7 +130,7 @@ class ModelWrapper:
                 self.model = self.model_class(
                     weights='imagenet',
                     include_top=True,
-                    input_shape=(224, 224, 3)
+                    input_shape=self.input_shape
                 )
                 # For TF models, processor is typically just a preprocessing function
                 self.processor = self.processor_class
@@ -143,9 +201,10 @@ class ModelWrapper:
             
             if has_activation:
                 # Here's the general idea:
-                # 1. Replace the layer's activation with a linear activation.
-                # 2. Add a new activation layer to the model with our polynomial approximation for the activation function.
-                # This is equivalent to replacing the activation function with a polynomial approximation. Consider, for example a layer with ReLU activation:
+                #    1. Replace the layer's activation with a linear activation.
+                #    2. Append a new activation layer after this layer with our polynomial approximation for the activation function.
+                # AFAICT, this is equivalent to replacing the activation function with a polynomial approximation.
+                # Consider, for example a layer with ReLU activation:
                 #    output = relu(W*x+b)
                 # becomes
                 #    temp = linear(W*x+b) = W*x+b
@@ -292,7 +351,7 @@ class ModelWrapper:
             'is_huggingface': self.is_huggingface,
             'model_type': self.model_type,
             'model_name': self.model_name,
-            'top_k': 10 
+            'top_k': self.config['prediction_decoder']['top_k']
         }
         
         # Add HuggingFace specific info if needed
@@ -342,44 +401,69 @@ class ModelWrapper:
 
     def retrain(self, train_data: np.ndarray, train_labels: np.ndarray, retrain_type: RetrainType = RetrainType.ITERATIVE) -> 'ModelWrapper':
         """Retrain the model"""
+        training_config = self.config['training']
+        
+        optimizer_name = training_config['optimizer'].lower()
+        if optimizer_name == 'adam':
+            optimizer = tf.keras.optimizers.legacy.Adam(learning_rate=training_config['learning_rate'])
+        else:
+            raise ValueError(f"Unsupported optimizer: {optimizer_name}")
+
         self.model.compile(
-            optimizer=tf.keras.optimizers.Adam(learning_rate=0.001),
-            loss=tf.keras.losses.CategoricalCrossentropy(),
-            metrics=['accuracy']
+            optimizer=optimizer,
+            loss=training_config['loss'],
+            metrics=training_config['metrics']
         )
+        
         if retrain_type == RetrainType.ITERATIVE:
             self._retrain_iterative(train_data, train_labels)
         elif retrain_type == RetrainType.ALL:
             self._retrain_all(train_data, train_labels)
         elif retrain_type == RetrainType.BATCHED:
-            self._retrain_batched(train_data, train_labels, batch_size=10)
+            self._retrain_batched(train_data, train_labels)
         return self
 
     def _retrain_iterative(self, train_data: np.ndarray, train_labels: np.ndarray) -> 'ModelWrapper':
         """Retrain the model iteratively on each activation layer"""
+        config = self.config['retraining']['iterative_mode']
         for activation_layer in self.get_activation_layers():
-            self.replace_activation(activation_layer, activation_layer.activation)
-            self.model.fit(train_data, train_labels, epochs=10)
+            self.replace_activation(activation_layer, self.activation_function)
+            self.model.fit(
+                train_data, 
+                train_labels, 
+                epochs=config['epochs'],
+                batch_size=self.config['training']['batch_size'],
+                validation_split=self.config['training']['validation_split']
+            )
         return self
 
     def _retrain_all(self, train_data: np.ndarray, train_labels: np.ndarray) -> 'ModelWrapper':
         """Retrain the model on all activation layers"""
-        self.model.fit(train_data, train_labels, epochs=10)
+        config = self.config['retraining']['all_mode']
+        for activation_layer in self.get_activation_layers():
+            self.replace_activation(activation_layer, self.activation_function)
+        self.model.fit(
+            train_data, 
+            train_labels, 
+            epochs=config['epochs'],
+            batch_size=self.config['training']['batch_size'],
+            validation_split=self.config['training']['validation_split']
+        )
         return self
 
-    def _retrain_batched(self, train_data: np.ndarray, train_labels: np.ndarray, batch_size: int = 10) -> 'ModelWrapper':
+    def _retrain_batched(self, train_data: np.ndarray, train_labels: np.ndarray) -> 'ModelWrapper':
         """Retrain the model in batches of activation layers"""
+        config = self.config['retraining']['batch_mode']
         activation_layers = self.get_activation_layers()
-        for i in range(0, len(activation_layers), batch_size):
-            batch = activation_layers[i:i+batch_size]
+        for i in range(0, len(activation_layers), config['batch_size']):
+            batch = activation_layers[i:i+config['batch_size']]
             for activation_layer in batch:
-                self.replace_activation(activation_layer, activation_layer.activation)
-            self.model.fit(train_data, train_labels, epochs=10)
-        return self
-
-    def replace_activation_and_retrain(self, original_activation_function: Callable, replacement_activation_function: Callable, train_data: np.ndarray, train_labels: np.ndarray) -> 'ModelWrapper':
-        """Replace the specified activation function and retrain the model"""
-        for activation_layer in self.get_activation_layers(original_activation_function.__name__):
-            self.replace_activation(activation_layer, replacement_activation_function)
-            self.retrain(train_data, train_labels)
+                self.replace_activation(activation_layer, self.activation_function)
+            self.model.fit(
+                train_data, 
+                train_labels, 
+                epochs=config['epochs'],
+                batch_size=self.config['training']['batch_size'],
+                validation_split=self.config['training']['validation_split']
+            )
         return self

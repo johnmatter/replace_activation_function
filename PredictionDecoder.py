@@ -26,17 +26,32 @@ class PredictionDecoder:
     def _get_keras_decoder(self, model_name: str):
         """Dynamically imports and caches the appropriate keras decode_predictions function"""
         if self._keras_decode_fn is None:
-            # Default to ResNet50 if model_name not specified or not found
-            module_path = self.KERAS_APPLICATIONS.get(
-                model_name.lower() if model_name else 'resnet',
-                'tensorflow.keras.applications.resnet50'
-            )
-            
-            # Import the appropriate module
-            module_parts = module_path.split('.')
-            self._keras_module = __import__(module_path, fromlist=['decode_predictions'])
-            self._keras_decode_fn = self._keras_module.decode_predictions
-            
+            if model_name:
+                # Find the matching module path
+                base_name = next(
+                    (
+                        key for key in self.KERAS_APPLICATIONS.keys()
+                        if model_name.lower().startswith(key)
+                    ),
+                    None
+                )
+                if base_name is None:
+                    raise ValueError(f"Unsupported Keras model: {model_name}")
+                    
+                # Get the full module path from KERAS_APPLICATIONS
+                module_path = self.KERAS_APPLICATIONS[base_name]
+                
+                # Import the appropriate module
+                module_parts = module_path.split('.')
+                base_module = __import__(module_parts[0])
+                for part in module_parts[1:]:
+                    base_module = getattr(base_module, part)
+                
+                self._keras_decode_fn = base_module.decode_predictions
+                
+            else:
+                raise ValueError("model_name must be specified")
+                
         return self._keras_decode_fn
 
     @staticmethod
@@ -46,7 +61,7 @@ class PredictionDecoder:
     ) -> Dict[str, Any]:
         """Create a decoder instance and process the outputs"""
         decoder = PredictionDecoder()
-        top_k = model_info.get('top_k', 5)
+        top_k = model_info.get('top_k', None)
 
         if model_info['is_huggingface']:
             return decoder._decode_huggingface(outputs, model_info, top_k)
@@ -57,7 +72,7 @@ class PredictionDecoder:
         self,
         outputs: Any,
         model_info: Dict[str, Any],
-        top_k: int
+        top_k: int = None
     ) -> Dict[str, Any]:
         """Decode Keras model outputs"""
         if model_info['model_type'] == 'image':
@@ -68,7 +83,10 @@ class PredictionDecoder:
             keras_decode_predictions = self._get_keras_decoder(model_info.get('model_name'))
             
             # Decode predictions
-            decoded_predictions = keras_decode_predictions(predictions.numpy(), top=top_k)
+            if top_k:
+                decoded_predictions = keras_decode_predictions(predictions.numpy(), top=top_k)
+            else:
+                decoded_predictions = keras_decode_predictions(predictions.numpy())
             
             # Format the results
             batch_labels = []
@@ -92,7 +110,7 @@ class PredictionDecoder:
     def _decode_huggingface(
         outputs: Any,
         model_info: Dict[str, Any],
-        top_k: int
+        top_k: int = None
     ) -> Dict[str, Any]:
         """Decode HuggingFace model outputs"""
         if model_info['model_type'] == 'image':

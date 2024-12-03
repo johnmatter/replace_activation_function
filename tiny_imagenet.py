@@ -3,10 +3,11 @@ from typing import Dict, Tuple
 import pandas as pd
 from PIL import Image
 import numpy as np
+import matplotlib.pyplot as plt
 
 class TinyImagenetLoader:
     @staticmethod
-    def load_tiny_imagenet(root_dir: str) -> Tuple[Dict, Dict, Dict]:
+    def load_tiny_imagenet(root_dir: str, dimensions: Tuple[int, int] = (224, 224)) -> Tuple[Dict, Dict, Dict]:
         """
         Load TinyImageNet dataset from disk.
         
@@ -37,13 +38,18 @@ class TinyImagenetLoader:
         train_images = []
         train_labels = []
         for class_id in class_ids:
+            # Handle grayscale images
             class_dir = os.path.join(root_dir, 'train', class_id, 'images')
             for img_file in os.listdir(class_dir):
                 if img_file.endswith('.JPEG'):
                     img_path = os.path.join(class_dir, img_file)
                     img = Image.open(img_path)
                     img = img.convert('RGB')
+                    img = img.resize(dimensions)
                     img = np.array(img)
+                    if img.ndim == 2:  # Handle grayscale
+                        img = img[..., np.newaxis]
+                        img = np.repeat(img, 3, axis=2)
                     train_images.append(img)
                     train_labels.append(label_map[class_id])
         
@@ -64,7 +70,11 @@ class TinyImagenetLoader:
             img_path = os.path.join(root_dir, 'val', 'images', row['filename'])
             img = Image.open(img_path)
             img = img.convert('RGB')
+            img = img.resize(dimensions)
             img = np.array(img)
+            if img.ndim == 2:  # Handle grayscale
+                img = img[..., np.newaxis]
+                img = np.repeat(img, 3, axis=2)
             val_images.append(img)
             val_labels.append(label_map[row['class_id']])
 
@@ -81,7 +91,11 @@ class TinyImagenetLoader:
                 img_path = os.path.join(test_dir, img_file)
                 img = Image.open(img_path)
                 img = img.convert('RGB')
+                img = img.resize(dimensions)
                 img = np.array(img)
+                if img.ndim == 2:  # Handle grayscale
+                    img = img[..., np.newaxis]
+                    img = np.repeat(img, 3, axis=2)
                 test_images.append(img)
 
         test_data = {
@@ -90,3 +104,12 @@ class TinyImagenetLoader:
 
         return train_data, val_data, test_data
 
+    @staticmethod
+    def show_example_images(data: Dict) -> None:
+        """Show random example images from the dataset, with labels"""
+        for i, idx in enumerate(np.random.randint(0, len(data['images']), 9)):
+            plt.subplot(3, 3, i+1)
+            plt.imshow(data['images'][idx])
+            plt.title(data['label_map'][data['labels'][idx]])
+            plt.axis('off')
+        plt.show()
