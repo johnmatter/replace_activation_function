@@ -1,4 +1,25 @@
 import tensorflow as tf
+
+# Configure TensorFlow for Metal GPU
+try:
+    physical_devices = tf.config.list_physical_devices('GPU')
+    if len(physical_devices) > 0:
+        # Enable memory growth
+        tf.config.experimental.set_memory_growth(physical_devices[0], True)
+        
+        # Limit GPU memory usage to 50%
+        memory_limit = 1024 * 4  # 4GB - adjust based on your GPU
+        tf.config.set_logical_device_configuration(
+            physical_devices[0],
+            [tf.config.LogicalDeviceConfiguration(memory_limit=memory_limit)]
+        )
+
+        print(f"GPU device found and configured: {physical_devices[0].device_type}")
+    else:
+        print("No GPU devices found, using CPU")
+except Exception as e:
+    print(f"Error configuring GPU: {e}")
+
 from tensorflow.keras.applications.resnet50 import ResNet50, preprocess_input
 from tensorflow.keras import activations
 
