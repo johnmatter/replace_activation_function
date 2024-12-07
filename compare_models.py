@@ -7,12 +7,12 @@ try:
         # Enable memory growth
         tf.config.experimental.set_memory_growth(physical_devices[0], True)
         
-        # Limit GPU memory usage to 50%
-        memory_limit = 1024 * 4  # 4GB - adjust based on your GPU
-        tf.config.set_logical_device_configuration(
-            physical_devices[0],
-            [tf.config.LogicalDeviceConfiguration(memory_limit=memory_limit)]
-        )
+        # # Limit GPU memory usage to 50%
+        # memory_limit = 1024 * 4  # 4GB - adjust based on your GPU
+        # tf.config.set_logical_device_configuration(
+        #     physical_devices[0],
+        #     [tf.config.LogicalDeviceConfiguration(memory_limit=memory_limit)]
+        # )
 
         print(f"GPU device found and configured: {physical_devices[0].device_type}")
     else:
@@ -121,23 +121,28 @@ def main():
     # ----------------------------------------------------------------
     # Load training data using TinyImagenetLoader
     print("\nLoading training data...")
-    train_data, val_data, _ = TinyImagenetLoader.load_tiny_imagenet(root_dir="/Users/matter/Downloads/tiny-imagenet-200")
+    train_data, val_data, _ = TinyImagenetLoader.load_tiny_imagenet(root_dir="/Users/matter/Downloads/tiny-imagenet-200", sample_percentage=10)
     
-    # Take only 10000 samples for quick testing
-    num_samples = 10000
-    train_images = train_data['images'][:num_samples]
-    train_labels = tf.keras.utils.to_categorical(train_data['labels'][:num_samples], num_classes=1000)
+    # Take up to 10000 samples for training, but no more than available
+    num_train_samples = 10000
+    actual_train_samples = min(len(train_data['images']), num_train_samples)
+    train_images = train_data['images'][:actual_train_samples]
+    train_labels = tf.keras.utils.to_categorical(train_data['labels'][:actual_train_samples], num_classes=1000)
     
-    # Take 1000 samples for validation
-    val_images = val_data['images'][:1000]
-    val_labels = tf.keras.utils.to_categorical(val_data['labels'][:1000], num_classes=1000)
+    # Take up to 1000 samples for validation, but no more than available
+    num_val_samples = 1000
+    actual_val_samples = min(len(val_data['images']), num_val_samples)
+    val_images = val_data['images'][:actual_val_samples]
+    val_labels = tf.keras.utils.to_categorical(val_data['labels'][:actual_val_samples], num_classes=1000)
+    
+    print(f"Using {actual_train_samples} training samples and {actual_val_samples} validation samples")
 
     # Show example images to confirm data are loaded correctly
     # TinyImagenetLoader.show_example_images(train_data)
     
     # ----------------------------------------------------------------
     # Retrain the modified model
-    modified_model.retrain(train_images, train_labels, RetrainType.ALL)
+    modified_model.retrain(train_images, train_labels, RetrainType.ITERATIVE)
 
     # Save the modified model
     modified_model.save("modified_model.keras")

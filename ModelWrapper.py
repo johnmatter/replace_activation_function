@@ -48,6 +48,10 @@ class ModelWrapper:
         input_shape: Tuple[int, int, int] = (224, 224, 3),
         config_path: Optional[str] = None
     ) -> None:
+        # Enable eager execution at the start
+        tf.config.run_functions_eagerly(True)
+        
+        # Initialize model-specific attributes
         self.model_name = model_name
         self.model_type = model_type
         self.debug = debug
@@ -59,12 +63,29 @@ class ModelWrapper:
         self.is_huggingface = is_huggingface
         self.input_shape = input_shape
         self.config = self._load_config(config_path)
+        self.activation_layer_pairs = []  # List of (original_layer, activation_layer) tuples
 
+        # Initialize compilation settings
+        self.base_settings = {
+            'loss': tf.keras.losses.CategoricalCrossentropy(from_logits=False),
+            'metrics': [tf.keras.metrics.CategoricalAccuracy(name='accuracy')],
+            'jit_compile': False
+        }
+        
+        # Initialize optimizer settings
+        self.current_compile_settings = None
+        self.current_optimizer = None
+        
+        # Initialize debug settings
         self.initialize_debug()
 
     def save(self, model_path: str) -> None:
         """Save the model"""
         self.model.save(model_path)
+
+    def print_model_summary(self) -> None:
+        """Print the model summary"""
+        self.model.summary()
 
     def initialize_debug(self) -> None:
         if self.debug is None:
@@ -82,37 +103,8 @@ class ModelWrapper:
             with open(config_path, 'r') as f:
                 return json.load(f)
         except FileNotFoundError:
-            # Return default config if file not found
-            warnings.warn(f"Config file not found at {config_path}.")
-            config = {
-                "training": {
-                    "epochs": 10,
-                    "batch_size": 32,
-                    "learning_rate": 0.001,
-                    "optimizer": "adam",
-                    "loss": "categorical_crossentropy",
-                    "metrics": ["accuracy"],
-                    "validation_split": 0.2
-                },
-                "retraining": {
-                    "batch_mode": {
-                        "batch_size": 10,
-                        "epochs": 10
-                    },
-                    "iterative_mode": {
-                        "epochs": 10
-                    },
-                    "all_mode": {
-                        "epochs": 10
-                    }
-                },
-                "prediction_decoder": {
-                    "top_k": None
-                }
-            }
-            print(f"Using default config: {config}")
-            return config
-    
+            raise FileNotFoundError(f"Config file not found at {config_path}")
+
     def set_activation_function(self, activation_function: Callable) -> 'ModelWrapper':
         self.activation_function = activation_function
         return self
@@ -201,38 +193,66 @@ class ModelWrapper:
                             config['activation'] != 'linear')
             
             if has_activation:
-                # Here's the general idea:
-                #    1. Replace the layer's activation with a linear activation.
-                #    2. Append a new activation layer after this layer with our polynomial approximation for the activation function.
-                # AFAICT, this is equivalent to replacing the activation function with a polynomial approximation.
-                # Consider, for example a layer with ReLU activation:
-                #    output = relu(W*x+b)
-                # becomes
-                #    temp = linear(W*x+b) = W*x+b
-                #    output = poly(temp) = poly(W*x+b) = a0 + a1*(W*x+b) + a2*(W*x+b)^2 + ...
-                # which is equivalent to:
-                #    output = poly(W*x+b) = a0 + a1*(W*x+b) + a2*(W*x+b)^2 + ...
+                # Track the layer pair if it's the type we want to replace
+                if config['activation'] == self.config['activation_type_to_replace']:
+                    # Here's the general idea:
+                    #    1. Replace the layer's activation with a linear activation.
+                    #    2. Append a new activation layer after this layer with our polynomial approximation for the activation function.
+                    # AFAICT, this is equivalent to replacing the activation function with a polynomial approximation.
+                    # Consider, for example a layer with ReLU activation:
+                    #    output = relu(W*x+b)
+                    # becomes
+                    #    temp = linear(W*x+b) = W*x+b
+                    #    output = poly(temp) = poly(W*x+b) = a0 + a1*(W*x+b) + a2*(W*x+b)^2 + ...
+                    # which is equivalent to:
+                    #    output = poly(W*x+b) = a0 + a1*(W*x+b) + a2*(W*x+b)^2 + ...
 
-                # Store the activation type
-                activation_type = config['activation']
-                # Remove activation from layer
-                config['activation'] = 'linear'
-                
-                # Clone layer without activation
-                if hasattr(layer, '_keras_api_names'):
-                    layer_type = layer.__class__
-                    new_layer = layer_type.from_config(config)
+                    # Store original weights if the layer has them
+                    original_weights = layer.get_weights() if hasattr(layer, 'get_weights') else None
+                    
+                    # Print debug info about the activation replacement
+                    print(f"\nSplitting activation for layer: {layer.name}")
+                    print(f"Original activation: {config['activation']}")
+                    if original_weights:
+                        print(f"Original weights shapes: {[w.shape for w in original_weights]}")
+                    
+                    # Special handling for final predictions layer
+                    if layer.name == 'predictions':
+                        # Keep the original layer with its weights
+                        x = layer(layer_input)
+                        new_layers.append(layer)
+                        layer_outputs[layer.output.name] = x
+                        continue
+                    
+                    # Remove activation from layer
+                    config['activation'] = 'linear'
+                    
+                    # Clone layer without activation
+                    if hasattr(layer, '_keras_api_names'):
+                        layer_type = layer.__class__
+                        new_layer = layer_type.from_config(config)
+                    else:
+                        new_layer = layer.__class__.from_config(config)
+                    
+                    # Restore original weights if they existed
+                    if original_weights:
+                        new_layer.set_weights(original_weights)
+                        print(f"Restored weights shapes: {[w.shape for w in new_layer.get_weights()]}")
+                    
+                    # Add the layer and its activation separately
+                    x = new_layer(layer_input)
+                    new_layers.append(new_layer)
+                    
+                    # Add separate activation layer
+                    activation_layer = tf.keras.layers.Activation(config['activation'], name=f'{layer.name}_activation')
+                    x = activation_layer(x)
+                    new_layers.append(activation_layer)
+                    
+                    self.activation_layer_pairs.append((new_layer, activation_layer))
                 else:
-                    new_layer = layer.__class__.from_config(config)
-                
-                # Add the layer and its activation separately
-                x = new_layer(layer_input)
-                new_layers.append(new_layer)
-                
-                # Add separate activation layer
-                activation_layer = tf.keras.layers.Activation(activation_type, name=f'{layer.name}_activation')
-                x = activation_layer(x)
-                new_layers.append(activation_layer)
+                    # This is an activation we don't want to replace, add as-is
+                    x = layer(layer_input)
+                    new_layers.append(layer)
             else:
                 # Layer doesn't have activation, add as-is
                 x = layer(layer_input)
@@ -312,16 +332,14 @@ class ModelWrapper:
 
         return self
 
-    def replace_activation(self, layer: tf.keras.layers.Activation, replacement_activation_function: Callable) -> 'ModelWrapper':
-        if layer.activation.__name__ == replacement_activation_function.base_activation.__name__:   
-            if self.debug['print_activation_replacement_debug']:
-                print(f"Replacing activation {replacement_activation_function.base_activation.__name__} with {replacement_activation_function.poly.dump()}")
-            layer.activation = replacement_activation_function
-            return self
-        else:
-            if self.debug['print_activation_replacement_debug']:
-                print(f"Skipping layer {layer.name} with activation {layer.activation.__name__}")
-            return self
+    def replace_activation(self, layer, new_activation):
+        """Replace activation function and add regularization"""
+        if hasattr(layer, 'activation'):
+            layer.activation = new_activation
+            
+            # Add L2 regularization to kernel if available
+            if hasattr(layer, 'kernel_regularizer'):
+                layer.kernel_regularizer = tf.keras.regularizers.l2(1e-4)
 
     def preprocess(self, inputs):
         if self.is_huggingface:
@@ -362,32 +380,43 @@ class ModelWrapper:
         # Use PredictionDecoder to handle the outputs
         return PredictionDecoder.decode(outputs, model_info)
 
-    def get_activation_layers(self, activation_type: Optional[str] = None) -> List[tf.keras.layers.Layer]:
-        """Get the activation layers"""
-        if activation_type is None:
-            return [layer for layer in self.model.layers if isinstance(layer, tf.keras.layers.Activation)]
-        return [layer for layer in self.model.layers if isinstance(layer, tf.keras.layers.Activation) and layer.activation.__name__ == activation_type]
+    def get_layer_before(self, activation_layer: tf.keras.layers.Layer) -> Optional[tf.keras.layers.Layer]:
+        """Get the layer that comes before the given activation layer"""
+        # Raise an error if the layer is the first layer
+        if self.model.layers.index(activation_layer) == 0:
+            raise ValueError("The specified layer is the first layer in the model")
+        layers = self.model.layers
+        for i, layer in enumerate(layers):
+            if layer is activation_layer and i > 0:
+                return layers[i - 1]
+        return None
 
-    def make_layers_trainable(self, trainable_layers: List[tf.keras.layers.Layer]) -> 'ModelWrapper':
-        """Make the specified layers trainable. All other layers will be non-trainable."""
-        for layer in self.model.layers:
-            if layer not in trainable_layers:
-                layer.trainable = False
-            else:
-                layer.trainable = True
-        return self
+    def get_layer_after(self, activation_layer: tf.keras.layers.Layer) -> Optional[tf.keras.layers.Layer]:
+        """Get the layer that comes after the given activation layer"""
+        layers = self.model.layers
+        for i, layer in enumerate(layers):
+            if layer is activation_layer and i < len(layers) - 1:
+                return layers[i + 1]
+        return None
+    
+    def get_trainable_layer_before(self, activation_layer: tf.keras.layers.Layer) -> Optional[tf.keras.layers.Layer]:
+        """Get the first trainable layer before the given activation layer"""
+        layer = self.get_layer_before(activation_layer)
+        # We can't check the trainable attribute, because we just set it to False.
+        # We should check for weights instead.  
+        while layer is not None and len(layer.weights) == 0:
+            layer = self.get_layer_before(layer)
+        return layer
 
-    def get_trainable_layers(self) -> List[tf.keras.layers.Layer]:
-        """Get the trainable layers"""
-        return [layer for layer in self.model.layers if layer.trainable]
+    def get_trainable_layer_after(self, activation_layer: tf.keras.layers.Layer) -> Optional[tf.keras.layers.Layer]:
+        """Get the first trainable layer after the given activation layer"""
+        layer = self.get_layer_after(activation_layer)
+        # We can't check the trainable attribute, because we just set it to False.
+        # We should check for weights instead.  
+        while layer is not None and len(layer.weights) == 0:
+            layer = self.get_layer_after(layer)
+        return layer
 
-    def get_non_trainable_layers(self) -> List[tf.keras.layers.Layer]:
-        """Get the non-trainable layers"""
-        return [layer for layer in self.model.layers if not layer.trainable]
-
-    def get_layer_before(self, layer: tf.keras.layers.Layer) -> tf.keras.layers.Layer:
-        """Get the layer before the specified layer"""
-        return self.model.layers[self.model.layers.index(layer) - 1]    
 
     def add_layer_before(self, layer: tf.keras.layers.Layer, new_layer: tf.keras.layers.Layer) -> 'ModelWrapper':
         """Add a layer before the specified layer"""
@@ -401,68 +430,19 @@ class ModelWrapper:
         return self
 
     def retrain(self, train_data: np.ndarray, train_labels: np.ndarray, retrain_type: RetrainType = RetrainType.ITERATIVE) -> 'ModelWrapper':
-        """Retrain the model with dynamic shape handling"""
+        """Retrain the model with the specified approach"""
         training_config = self.config['training']
-        validation_split = training_config['validation_split']
         
-        # Function to infer and validate shapes
-        def prepare_data(data, labels):
-            # Convert to tensors if needed
-            if isinstance(data, np.ndarray):
-                data = tf.convert_to_tensor(data, dtype=tf.float32)
-            if isinstance(labels, np.ndarray):
-                labels = tf.convert_to_tensor(labels, dtype=tf.float32)
-            
-            # Get shapes
-            data_shape = tf.shape(data)
-            model_input_shape = self.model.input_shape
-            
-            # Handle different dimension cases
-            if len(data.shape) < len(model_input_shape):
-                # Add missing dimensions
-                for _ in range(len(model_input_shape) - len(data.shape)):
-                    data = tf.expand_dims(data, axis=0)
-            elif len(data.shape) > len(model_input_shape):
-                # Remove extra dimensions if they're singleton
-                while len(data.shape) > len(model_input_shape):
-                    if data.shape[0] == 1:
-                        data = tf.squeeze(data, axis=0)
-                    else:
-                        raise ValueError(f"Data shape {data.shape} has too many non-singleton dimensions for model input shape {model_input_shape}")
-            
-            # Validate final shapes
-            dynamic_axes = [i for i, dim in enumerate(model_input_shape) if dim is None]
-            static_axes = [i for i, dim in enumerate(model_input_shape) if dim is not None]
-            
-            for axis in static_axes[1:]:  # Skip batch dimension
-                if data.shape[axis] != model_input_shape[axis]:
-                    raise ValueError(f"Dimension mismatch at axis {axis}: expected {model_input_shape[axis]}, got {data.shape[axis]}")
-            
-            return data, labels
+        # Prepare datasets
+        train_dataset, val_dataset = self.prepare_data(train_data, train_labels)
         
-        # Prepare the data
-        train_data, train_labels = prepare_data(train_data, train_labels)
-        
-        # Calculate split point for validation - Fix the type conversion issue
-        num_samples = tf.cast(tf.shape(train_data)[0], tf.float32)
-        split_at = tf.cast(num_samples * (1 - validation_split), tf.int32)
-        
-        # Create datasets
-        train_dataset = tf.data.Dataset.from_tensor_slices((
-            train_data[:split_at],
-            train_labels[:split_at]
-        )).cache().batch(
-            training_config['batch_size'],
-            drop_remainder=True
-        ).prefetch(tf.data.AUTOTUNE)
-        
-        val_dataset = tf.data.Dataset.from_tensor_slices((
-            train_data[split_at:],
-            train_labels[split_at:]
-        )).batch(
-            training_config['batch_size'],
-            drop_remainder=True
-        ).prefetch(tf.data.AUTOTUNE)
+        # Debug dataset structure
+        print("\nDebugging dataset structure:")
+        for x, y in train_dataset.take(1):
+            print(f"Input shape: {x.shape}")
+            print(f"Label shape: {y.shape}")
+            print(f"Input dtype: {x.dtype}")
+            print(f"Label dtype: {y.dtype}")
         
         # Configure optimizer
         optimizer_name = training_config['optimizer'].lower()
@@ -473,13 +453,21 @@ class ModelWrapper:
         else:
             raise ValueError(f"Unsupported optimizer: {optimizer_name}")
 
-        # Compile model
-        self.model.compile(
-            optimizer=optimizer,
-            loss=training_config['loss'],
-            metrics=training_config['metrics'],
-            jit_compile=False
-        )
+        # Debug model structure
+        print("\nDebugging model structure:")
+        print(f"Model input shape: {self.model.input_shape}")
+        print(f"Model output shape: {self.model.output_shape}")
+        
+        # Configure base model compilation settings
+        self.base_compile_settings = {
+            'optimizer': optimizer,
+            'loss': tf.keras.losses.CategoricalCrossentropy(from_logits=False),  # Changed from_logits to False
+            'metrics': [tf.keras.metrics.CategoricalAccuracy(name='accuracy')],
+            'jit_compile': False
+        }
+        
+        # Initial compilation
+        self.model.compile(**self.base_compile_settings)
         
         # Execute retraining strategy
         if retrain_type == RetrainType.ITERATIVE:
@@ -492,40 +480,294 @@ class ModelWrapper:
         return self
 
     def _retrain_iterative(self, train_dataset: tf.data.Dataset, val_dataset: tf.data.Dataset) -> 'ModelWrapper':
-        """Retrain the model iteratively on each activation layer"""
+        """Retrain the model iteratively, one activation layer at a time"""
         config = self.config['retraining']['iterative_mode']
-        for activation_layer in self.get_activation_layers():
+        
+        for idx, layer_pair in enumerate(self.activation_layer_pairs):
+            print(f"\nProcessing activation layer {idx+1}/{len(self.activation_layer_pairs)}: {layer_pair[1].name}")
+            
+            # 1. Reset all layers to non-trainable
+            self._reset_trainable_layers()
+            
+            # Get the activation layer from the pair
+            activation_layer = layer_pair[1]  # The second element is the activation layer
+            
+            # 2. Get surrounding layers
+            prev_layer = self.get_trainable_layer_before(activation_layer)
+            next_layer = self.get_trainable_layer_after(activation_layer)
+            
+            # 3. Warmup phase - train only surrounding layers
+            if prev_layer:
+                prev_layer.trainable = True
+                print(f"Training layer before {activation_layer.name}: {prev_layer.name}")
+            if next_layer:
+                next_layer.trainable = True
+                print(f"Training layer after {activation_layer.name}: {next_layer.name}")
+                
+            # 4. Replace activation
             self.replace_activation(activation_layer, self.activation_function)
-            self.model.fit(
-                train_dataset, 
-                epochs=config['epochs'],
-                validation_data=val_dataset
+            
+            # 5. Compile with very low learning rate for warmup
+            self.reset_optimizer(learning_rate_scale=0.001)
+            self.model.compile(**self.current_compile_settings)
+            
+            # 6. Warmup training
+            self._fit(
+                train_dataset,
+                epochs=2,
+                validation_data=val_dataset,
+                callbacks=self._get_callbacks()
             )
+            
+            # 7. Main training phase - include more surrounding layers
+            self._gradually_unfreeze_layers(activation_layer, num_layers=2)
+            
+            # 8. Compile with slightly higher learning rate
+            self.reset_optimizer(learning_rate_scale=0.01)
+            self.model.compile(**self.current_compile_settings)
+            
+            # 9. Main training
+            self._fit(
+                train_dataset,
+                epochs=config['epochs'],
+                validation_data=val_dataset,
+                callbacks=self._get_callbacks()
+            )
+        
         return self
 
+    def _gradually_unfreeze_layers(self, center_layer, num_layers=2):
+        """Unfreeze layers gradually outward from the center layer"""
+        layer_list = self.model.layers
+        center_idx = layer_list.index(center_layer)
+        
+        start_idx = max(0, center_idx - num_layers)
+        end_idx = min(len(layer_list), center_idx + num_layers + 1)
+        
+        for layer in layer_list[start_idx:end_idx]:
+            if isinstance(layer, tf.keras.layers.BatchNormalization):
+                continue  # Keep BN layers frozen
+            layer.trainable = True
+
     def _retrain_all(self, train_dataset: tf.data.Dataset, val_dataset: tf.data.Dataset) -> 'ModelWrapper':
-        """Retrain the model on all activation layers"""
+        """Retrain the model on all activation layers at once"""
         config = self.config['retraining']['all_mode']
-        for activation_layer in self.get_activation_layers():
+        activation_layers = self.split_activation_layers
+        
+        # 1. Reset all layers to non-trainable
+        for layer in self.model.layers:
+            layer.trainable = False
+        
+        # 2. Make specific layers trainable and replace activations
+        for activation_layer in activation_layers:
+            if config['train_before_activation']:
+                layer_before = self.get_layer_before(activation_layer)
+                layer_before.trainable = True
+            elif config['train_after_activation']:
+                layer_after = self.get_layer_after(activation_layer)
+                layer_after.trainable = True
+            
             self.replace_activation(activation_layer, self.activation_function)
-        self.model.fit(
+        
+        # Reset optimizer with reduced learning rate for fine-tuning
+        self.reset_optimizer(learning_rate_scale=0.01)
+        
+        # Compile with fresh settings
+        self.model.compile(**self.current_compile_settings)
+        
+        # 4. Train once with all replacements
+        self._fit(
             train_dataset, 
             epochs=config['epochs'],
             validation_data=val_dataset
         )
+        
         return self
 
     def _retrain_batched(self, train_dataset: tf.data.Dataset, val_dataset: tf.data.Dataset) -> 'ModelWrapper':
         """Retrain the model in batches of activation layers"""
         config = self.config['retraining']['batch_mode']
-        activation_layers = self.get_activation_layers()
-        for i in range(0, len(activation_layers), config['batch_size']):
-            batch = activation_layers[i:i+config['batch_size']]
-            for activation_layer in batch:
+        activation_layers = self.split_activation_layers
+        
+        for i in range(0, len(activation_layers), config['activation_replacement_batch_size']):
+            # Get current batch of activation layers
+            batch_layers = activation_layers[i:i + config['activation_replacement_batch_size']]
+            
+            # 1. Reset all layers to non-trainable
+            for layer in self.model.layers:
+                layer.trainable = False
+            
+            # 2. Make specific layers trainable and replace activations for this batch
+            for activation_layer in batch_layers:
+                if config['train_before_activation']:
+                    layer_before = self.get_layer_before(activation_layer)
+                    layer_before.trainable = True
+                elif config['train_after_activation']:
+                    layer_after = self.get_layer_after(activation_layer)
+                    layer_after.trainable = True
+                
                 self.replace_activation(activation_layer, self.activation_function)
-            self.model.fit(
+            
+            # Reset optimizer with reduced learning rate for fine-tuning
+            self.reset_optimizer(learning_rate_scale=0.01)
+            
+            # Compile with fresh settings
+            self.model.compile(**self.current_compile_settings)
+            
+            # 4. Train on current batch of replacements
+            self._fit(
                 train_dataset, 
                 epochs=config['epochs'],
                 validation_data=val_dataset
             )
+        
         return self
+
+    def get_input_layer_name(self) -> str:
+        """Get the current input layer name of the model"""
+        # Try multiple methods to get the input layer name
+        if hasattr(self.model, 'input_names') and self.model.input_names:
+            return self.model.input_names[0]
+        
+        if hasattr(self.model, 'input_layer'):
+            if self.model.input_layer is not None:
+                return self.model.input_layer.name
+        
+        if hasattr(self.model, 'input'):
+            try:
+                # Get the name without any tensor suffixes
+                name = self.model.input.name.split(':')[0]
+                # If the name contains keras_tensor, use the layer name instead
+                if 'keras_tensor' in name:
+                    return self.model.layers[0].name
+                return name
+            except (AttributeError, TypeError):
+                pass
+        
+        # Fallback to first layer name
+        return self.model.layers[0].name
+
+    def prepare_data(self, data: np.ndarray, labels: np.ndarray) -> Tuple[tf.data.Dataset, tf.data.Dataset]:
+        """Prepare and validate data for training, returning train and validation datasets"""
+        training_config = self.config['training']
+        validation_split = training_config['validation_split']
+
+        # Convert to tensors if needed
+        if isinstance(data, np.ndarray):
+            data = tf.convert_to_tensor(data, dtype=tf.float32)
+        if isinstance(labels, np.ndarray):
+            labels = tf.convert_to_tensor(labels, dtype=tf.float32)
+        
+        # Get shapes
+        data_shape = tf.shape(data)
+        model_input_shape = self.model.input_shape
+        
+        # Handle different dimension cases
+        if len(data.shape) < len(model_input_shape):
+            # Add missing dimensions
+            for _ in range(len(model_input_shape) - len(data.shape)):
+                data = tf.expand_dims(data, axis=0)
+        elif len(data.shape) > len(model_input_shape):
+            # Remove extra dimensions if they're singleton
+            while len(data.shape) > len(model_input_shape):
+                if data.shape[0] == 1:
+                    data = tf.squeeze(data, axis=0)
+                else:
+                    raise ValueError(f"Data shape {data.shape} has too many non-singleton dimensions for model input shape {model_input_shape}")
+        
+        # Validate final shapes
+        dynamic_axes = [i for i, dim in enumerate(model_input_shape) if dim is None]
+        static_axes = [i for i, dim in enumerate(model_input_shape) if dim is not None]
+        
+        for axis in static_axes[1:]:  # Skip batch dimension
+            if data.shape[axis] != model_input_shape[axis]:
+                raise ValueError(f"Dimension mismatch at axis {axis}: expected {model_input_shape[axis]}, got {data.shape[axis]}")
+
+        # Calculate split point for validation
+        num_samples = tf.cast(tf.shape(data)[0], tf.float32)
+        split_at = tf.cast(num_samples * (1 - validation_split), tf.int32)
+
+        # Create training dataset with proper mapping
+        train_dataset = tf.data.Dataset.from_tensor_slices(
+            (data[:split_at], labels[:split_at])
+        ).cache().batch(
+            training_config['batch_size'],
+            drop_remainder=True
+        ).map(
+            lambda x, y: (x, tf.cast(y, tf.float32))
+        ).prefetch(tf.data.AUTOTUNE)
+
+        # Create validation dataset with proper mapping
+        val_dataset = tf.data.Dataset.from_tensor_slices(
+            (data[split_at:], labels[split_at:])
+        ).batch(
+            training_config['batch_size'],
+            drop_remainder=True
+        ).map(
+            lambda x, y: (x, tf.cast(y, tf.float32))
+        ).prefetch(tf.data.AUTOTUNE)
+
+        return train_dataset, val_dataset
+
+    def reset_optimizer(self, learning_rate_scale: float = 1.0):
+        """Reset optimizer with scaled learning rate and update compilation settings"""
+        training_config = self.config['training']
+        optimizer_name = training_config['optimizer'].lower()
+        
+        if optimizer_name == 'adam':
+            optimizer = tf.keras.optimizers.Adam(
+                learning_rate=training_config['learning_rate'] * learning_rate_scale,
+                clipnorm=1.0
+            )
+        else:
+            raise ValueError(f"Unsupported optimizer: {optimizer_name}")
+        
+        # Update current compilation settings with new optimizer and base settings
+        self.current_compile_settings = {
+            'optimizer': optimizer,
+            **self.base_settings  # Spread the base settings we defined in __init__
+        }
+
+    def _get_callbacks(self):
+        return [
+            tf.keras.callbacks.EarlyStopping(
+                monitor='val_loss',
+                patience=3,
+                restore_best_weights=True
+            ),
+            tf.keras.callbacks.ReduceLROnPlateau(
+                monitor='val_loss',
+                factor=0.2,
+                patience=2,
+                min_lr=1e-6
+            )
+        ]
+
+    def _reset_trainable_layers(self):
+        """Reset all layers to non-trainable state"""
+        for layer in self.model.layers:
+            layer.trainable = False
+
+    def _fit(self, *args, **kwargs):
+        """Wrapper around model.fit with safety checks"""
+        # Count trainable parameters
+        trainable_params = sum([
+            tf.size(var).numpy() 
+            for var in self.model.trainable_variables
+        ])
+        
+        if trainable_params == 0:
+            raise ValueError(
+                "Model has 0 trainable parameters. "
+                f"Check that layers are properly set to trainable before training. "
+                f"Current trainable layers: {[layer.name for layer in self.model.layers if layer.trainable]}"
+            )
+        
+        # Print trainable parameter count and layers for debugging
+        print(f"\nTraining with {trainable_params:,} trainable parameters")
+        print("Trainable layers:")
+        for layer in self.model.layers:
+            if layer.trainable:
+                print(f"- {layer.name}: {sum(tf.size(var).numpy() for var in layer.trainable_variables):,} parameters")
+        
+        return self.model.fit(*args, **kwargs)
