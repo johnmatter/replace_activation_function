@@ -132,7 +132,10 @@ class ModelWrapper:
         return self
 
     def split_activation_layers(self) -> tf.keras.Model:
-        """Split activation layers from their parent layers"""
+        """Split activation layers from their parent layers, replacing them with separate activation layers."""
+        if self.debug.get('print_network_split_debug', False):
+            print("\nStarting split_activation_layers")
+
         # Get the base model depending on the type
         if hasattr(self.model, 'keras_model'):
             # HuggingFace models with direct Keras model
@@ -161,39 +164,47 @@ class ModelWrapper:
 
         # Create a dictionary to store the tensor outputs for each layer
         layer_outputs = {}
-        layer_outputs[base_model.input.name] = x
-        
+        layer_outputs[inputs] = x  # Use tensors directly as keys
+
         for layer in base_model.layers:
-            if self.debug['print_network_split_debug']:
-                print(f"Processing layer: {layer.name}, type: {type(layer)}")
-            
+            if self.debug.get('print_network_split_debug', False):
+                print(f"\nProcessing layer: {layer.name}, type: {type(layer)}")
+
             # Skip input layer
             if isinstance(layer, tf.keras.layers.InputLayer):
                 continue
-                
-            # Get the correct input for this layer
-            if isinstance(layer, (tf.keras.layers.Add, tf.keras.layers.Concatenate)):
-                layer_input = [layer_outputs[inp.name] for inp in layer.input]
-            else:
-                layer_input = layer_outputs[layer.input.name] if hasattr(layer, 'input') and layer.input is not None else x
-                
+
+            # Get the input to the current layer
+            try:
+                if isinstance(layer.input, list):
+                    layer_input = [layer_outputs.get(inp, None) for inp in layer.input]
+                    if None in layer_input:
+                        missing_inputs = [inp for inp, l_inp in zip(layer.input, layer_input) if l_inp is None]
+                        raise KeyError(f"Missing inputs for layer {layer.name}: {missing_inputs}")
+                else:
+                    layer_input = layer_outputs.get(layer.input, None)
+                    if layer_input is None:
+                        raise KeyError(f"Missing input for layer {layer.name}: {layer.input}")
+            except Exception as e:
+                print(f"Error getting input for layer {layer.name}: {e}")
+                raise
+
             # Special handling for BatchNormalization
             if isinstance(layer, tf.keras.layers.BatchNormalization):
-                if self.debug['print_network_split_debug']:
+                if self.debug.get('print_network_split_debug', False):
                     print(f"Found BatchNorm layer: {layer.name}")
-                x = layer(layer_input)  # Use layer_input instead of x
+                x = layer(layer_input)
                 new_layers.append(layer)
-                layer_outputs[layer.output.name] = x
+                layer_outputs[layer.output] = x
                 continue
-                
+
             # Get layer config and check for activation
             config = layer.get_config()
             has_activation = ('activation' in config and 
-                            config['activation'] is not None and 
-                            config['activation'] != 'linear')
-            
+                              config['activation'] is not None and 
+                              config['activation'] != 'linear')
+
             if has_activation:
-                # Track the layer pair if it's the type we want to replace
                 if config['activation'] == self.config['activation_type_to_replace']:
                     # Here's the general idea:
                     #    1. Replace the layer's activation with a linear activation.
@@ -206,110 +217,68 @@ class ModelWrapper:
                     #    output = poly(temp) = poly(W*x+b) = a0 + a1*(W*x+b) + a2*(W*x+b)^2 + ...
                     # which is equivalent to:
                     #    output = poly(W*x+b) = a0 + a1*(W*x+b) + a2*(W*x+b)^2 + ...
+                    if self.debug.get('print_activation_replacement_debug', False):
+                        print(f"Replacing activation in layer {layer.name}")
 
                     # Store original weights if the layer has them
                     original_weights = layer.get_weights() if hasattr(layer, 'get_weights') else None
-                    
-                    # Print debug info about the activation replacement
-                    print(f"\nSplitting activation for layer: {layer.name}")
-                    print(f"Original activation: {config['activation']}")
-                    if original_weights:
-                        print(f"Original weights shapes: {[w.shape for w in original_weights]}")
-                    
-                    # Special handling for final predictions layer
-                    if layer.name == 'predictions':
-                        # Keep the original layer with its weights
-                        x = layer(layer_input)
-                        new_layers.append(layer)
-                        layer_outputs[layer.output.name] = x
-                        continue
-                    
-                    # Remove activation from layer
+
+                    # Remove activation from config
+                    original_activation = config['activation']
                     config['activation'] = 'linear'
-                    
+
                     # Clone layer without activation
-                    if hasattr(layer, '_keras_api_names'):
-                        layer_type = layer.__class__
-                        new_layer = layer_type.from_config(config)
-                    else:
-                        new_layer = layer.__class__.from_config(config)
-                    
-                    # Restore original weights if they existed
-                    if original_weights:
-                        new_layer.set_weights(original_weights)
-                        print(f"Restored weights shapes: {[w.shape for w in new_layer.get_weights()]}")
-                    
-                    # Add the layer and its activation separately
+                    new_layer = layer.__class__.from_config(config)
+
+                    # Restore original weights
+                    try:
+                        if isinstance(layer, tf.keras.layers.Activation):
+                            input_shape = layer.input.shape
+                            new_layer.build(input_shape)
+                        else:
+                            new_layer.build(layer.input_shape)
+                    except AttributeError as e:
+                        print(f"Warning: Could not build layer {layer.name} due to missing shape information")
+                        print(f"Layer type: {type(layer)}")
+                        print(f"Error: {e}")
+                        raise
+
+                    # Add the new layer
                     x = new_layer(layer_input)
                     new_layers.append(new_layer)
-                    
-                    # Add separate activation layer
-                    activation_layer = tf.keras.layers.Activation(config['activation'], name=f'{layer.name}_activation')
+
+                    # Create the new activation layer with the same name
+                    activation_layer = tf.keras.layers.Activation(
+                        activation=original_activation,
+                        name=f"{layer.name}_activation"
+                    )
                     x = activation_layer(x)
                     new_layers.append(activation_layer)
-                    
+
+                    # Save the pair for replacement during retraining
                     self.activation_layer_pairs.append((new_layer, activation_layer))
                 else:
-                    # This is an activation we don't want to replace, add as-is
+                    # Layers with activations not being replaced
                     x = layer(layer_input)
                     new_layers.append(layer)
             else:
-                # Layer doesn't have activation, add as-is
+                # Layers without activations
                 x = layer(layer_input)
                 new_layers.append(layer)
-            
+
             # Store the output tensor
-            layer_outputs[layer.output.name] = x
-        
+            layer_outputs[layer.output] = x
+
+            if self.debug.get('print_network_split_debug', False):
+                print(f"Layer {layer.name} output stored.")
+
         # Create new model
         new_model = tf.keras.Model(inputs=inputs, outputs=x)
-        
-        # Create a mapping of old to new layers
-        old_to_new = {}
-        new_idx = 0
-        
-        for old_layer in base_model.layers:
-            if isinstance(old_layer, tf.keras.layers.InputLayer):
-                continue
-                
-            if isinstance(old_layer, tf.keras.layers.BatchNormalization):
-                if self.debug['print_network_split_debug']:
-                    print(f"Skipping mapping for BatchNorm: {old_layer.name}")
-                continue
-                
-            # Find the corresponding new layer
-            while new_idx < len(new_layers):
-                new_layer = new_layers[new_idx]
-                if isinstance(new_layer, tf.keras.layers.BatchNormalization):
-                    new_idx += 1
-                    continue
-                    
-                # Map the layers if they have the same base name (ignoring activation suffix)
-                old_base_name = old_layer.name.replace('_activation', '')
-                new_base_name = new_layer.name.replace('_activation', '')
-                
-                if old_base_name == new_base_name:
-                    old_to_new[old_layer] = new_layer
-                    if self.debug['print_network_split_debug']:
-                        print(f"Mapped {old_layer.name} -> {new_layer.name}")
-                    new_idx += 1
-                    break
-                new_idx += 1
-        
-        # Copy weights using the mapping
-        for old_layer, new_layer in old_to_new.items():
-            if hasattr(old_layer, 'get_weights'):
-                weights = old_layer.get_weights()
-                if weights:  # Only set weights if layer has weights
-                    if self.debug['print_network_split_debug']:
-                        print(f"Copying weights from {old_layer.name} to {new_layer.name}")
-                    try:
-                        new_layer.set_weights(weights)
-                    except ValueError as e:
-                        if self.debug['print_network_split_debug']:
-                            print(f"Failed to copy weights: {e}")
-                        continue
-        
+        self.model = new_model
+
+        if self.debug.get('print_network_split_debug', False):
+            print("Finished split_activation_layers")
+
         return new_model
         
     def replace_all_activations(self, original_activation_function: Callable, replacement_activation_function: Callable) -> 'ModelWrapper':

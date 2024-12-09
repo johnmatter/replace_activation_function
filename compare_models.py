@@ -100,7 +100,11 @@ def main():
         model_class=ResNet50,
         processor_class=preprocess_input,
         is_huggingface=False,
-        input_shape=(224, 224, 3)
+        input_shape=(224, 224, 3),
+        debug={
+            'print_activation_replacement_debug': True,
+            'print_network_split_debug': True
+        }
     )
     modified_model.create_base_model()
     
