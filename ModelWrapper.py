@@ -120,15 +120,25 @@ class ModelWrapper:
         else:
             # Handle native TensorFlow models
             if self.model_class is not None:
-                self.model = self.model_class(
-                    weights='imagenet',
-                    include_top=True,
-                    input_shape=self.input_shape
-                )
-                # For TF models, processor is typically just a preprocessing function
-                self.processor = self.processor_class
+                if callable(self.model_class) and not isinstance(self.model_class, type):
+                    # Handle custom model function
+                    self.model = self.model_class()
+                else:
+                    # Handle built-in Keras models
+                    if self.model_type == "image":
+                        self.model = self.model_class(
+                            weights='imagenet',
+                            input_shape=self.input_shape,
+                            include_top=True
+                        )
+                    else:
+                        self.model = self.model_class()
+                    
+                if self.processor_class is not None:
+                    self.processor = self.processor_class
             else:
-                raise ValueError("Model class must be provided for TensorFlow models.")
+                raise ValueError("Model class must be provided")
+        
         return self
 
     def split_activation_layers(self) -> tf.keras.Model:
