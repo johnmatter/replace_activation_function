@@ -262,7 +262,8 @@ original_model = ModelWrapper(
     is_huggingface=False,
     input_shape=(4,),
     debug={
-        'print_activation_replacement_debug': True
+        'print_activation_replacement_debug': True,
+        'print_network_split_debug': True
     },
     regularizer=l2_regularizer  # Pass the regularizer here
 )
@@ -312,9 +313,9 @@ chebyshev_activation = factory.create()
 dummy_input = tf.random.normal((1,) + modified_model.input_shape)
 _ = modified_model.model(dummy_input)
 
-# Split activation layers and set activation function
-modified_model.model = modified_model.split_activation_layers()
+# Set activation function first, then split the layers. This must be done in this order for now.
 modified_model.set_activation_function(chebyshev_activation)
+modified_model.model = modified_model.split_activation_layers()
 
 # Retrain the modified model
 print("Retraining the modified model using existing retraining strategies...")

@@ -34,7 +34,7 @@ from PredictionDecoder import PredictionDecoder
 class RetrainType(Enum):
     """Enum for different types of retraining"""
     ALL = "all"
-    BATCHEDger = "batched"
+    BATCHED = "batched"
     ITERATIVE = "iterative"
 
 class ModelWrapper:
@@ -60,12 +60,13 @@ class ModelWrapper:
         self.debug = debug or {}
         self.model = None
         self.processor = None
-        self.activation_function = None
         self.model_class = model_class
         self.processor_class = processor_class
         self.is_huggingface = is_huggingface
         self.input_shape = input_shape
         self.config = self._load_config(config_path)
+        self.activation_function = None
+        self.activation_function_to_replace = self.config.get('activation_type_to_replace', None)
         self.activation_layer_pairs = []  # List of (original_layer, activation_layer) tuples
         self.model_kwargs = model_kwargs  # Store additional kwargs
 
@@ -82,6 +83,10 @@ class ModelWrapper:
         
         # Initialize debug settings
         self.initialize_debug()
+
+        # If config contains activation type to replace, set it
+        if 'activation_type_to_replace' in self.config:
+            self.activation_function_to_replace = self.config['activation_type_to_replace']
 
     def save(self, model_path: str) -> None:
         """Save the model"""
@@ -109,7 +114,8 @@ class ModelWrapper:
         except FileNotFoundError:
             raise FileNotFoundError(f"Config file not found at {config_path}")
 
-    def set_activation_function(self, activation_function: Callable) -> 'ModelWrapper':
+    def set_activation_function(self, activation_function):
+        """Set the activation function to use for replacement."""
         self.activation_function = activation_function
         return self
         
@@ -149,157 +155,143 @@ class ModelWrapper:
         return self
 
     def split_activation_layers(self) -> tf.keras.Model:
-        """Split activation layers from their parent layers, replacing them with separate activation layers."""
+        """Split activation layers from their parent layers."""
+        if self.activation_function_to_replace is None:
+            raise ValueError("activation_function_to_replace must be set in config before splitting layers")
+        
         if self.debug.get('print_network_split_debug', False):
             print("\nStarting split_activation_layers")
 
-        # Get the base model depending on the type
-        if hasattr(self.model, 'keras_model'):
-            # HuggingFace models with direct Keras model
-            base_model = self.model.keras_model
-        elif hasattr(self.model, 'vit') and hasattr(self.model.vit, 'encoder'):
-            # HuggingFace ViT models
-            base_model = self.model.vit
-            image_size = self.model.config.image_size
-            num_channels = 3
-            inputs = tf.keras.Input(shape=(image_size, image_size, num_channels))
-            x = inputs
-            x = base_model(x)
-            base_model = tf.keras.Model(inputs=inputs, outputs=x)
-        elif isinstance(self.model, tf.keras.Model):
-            # Native TensorFlow/Keras models
-            base_model = self.model
-        else:
-            raise ValueError("This model type is not currently supported for activation splitting")
-        
-        # TODO: fix this error. compare https://github.com/tensorflow/tensorflow/issues/30770
-        # AttributeError: The layer sequential_1 has never been called and thus has no defined input.. Did you mean: 'inputs'?
-        try:
-            inputs = base_model.input
-        except AttributeError:
-            raise ValueError("The model has no inputs defined. Ensure the model is properly initialized.")
-        
-        x = inputs
-        new_layers = []
+        # Reset activation_layer_pairs
+        self.activation_layer_pairs = []
 
-        # Create a dictionary to store the tensor outputs for each layer
-        layer_outputs = {}
-        layer_outputs[inputs] = x  # Use tensors directly as keys
-
-        for layer in base_model.layers:
+        # Check if the model is Sequential or Functional
+        if isinstance(self.model, tf.keras.Sequential):
             if self.debug.get('print_network_split_debug', False):
-                print(f"\nProcessing layer: {layer.name}, type: {type(layer)}")
+                print("Model is Sequential.")
 
-            # Skip input layer
-            if isinstance(layer, tf.keras.layers.InputLayer):
-                continue
+            # Create a new list of layers
+            new_layers = []
 
-            # Get the input to the current layer
-            try:
-                if isinstance(layer.input, list):
-                    layer_input = [layer_outputs.get(inp, None) for inp in layer.input]
-                    if None in layer_input:
-                        missing_inputs = [inp for inp, l_inp in zip(layer.input, layer_input) if l_inp is None]
-                        raise KeyError(f"Missing inputs for layer {layer.name}: {missing_inputs}")
-                else:
-                    layer_input = layer_outputs.get(layer.input, None)
-                    if layer_input is None:
-                        raise KeyError(f"Missing input for layer {layer.name}: {layer.input}")
-            except Exception as e:
-                print(f"Error getting input for layer {layer.name}: {e}")
-                raise
+            for layer in self.model.layers:
+                # Get layer config
+                config = layer.get_config()
 
-            # Special handling for BatchNormalization
-            if isinstance(layer, tf.keras.layers.BatchNormalization):
-                if self.debug.get('print_network_split_debug', False):
-                    print(f"Found BatchNorm layer: {layer.name}")
-                x = layer(layer_input)
-                new_layers.append(layer)
-                layer_outputs[layer.output] = x
-                continue
+                # Check if the layer has 'activation' in its config
+                has_activation_in_config = (
+                    'activation' in config and
+                    config['activation'] is not None and
+                    config['activation'] != 'linear'
+                )
 
-            # Get layer config and check for activation
-            config = layer.get_config()
-            has_activation = ('activation' in config and 
-                              config['activation'] is not None and 
-                              config['activation'] != 'linear')
-
-            if has_activation:
-                if config['activation'] == self.config['activation_type_to_replace']:
-                    # Here's the general idea:
-                    #    1. Replace the layer's activation with a linear activation.
-                    #    2. Append a new activation layer after this layer with our polynomial approximation for the activation function.
-                    # AFAICT, this is equivalent to replacing the activation function with a polynomial approximation.
-                    # Consider, for example a layer with ReLU activation:
-                    #    output = relu(W*x+b)
-                    # becomes
-                    #    temp = linear(W*x+b) = W*x+b
-                    #    output = poly(temp) = poly(W*x+b) = a0 + a1*(W*x+b) + a2*(W*x+b)^2 + ...
-                    # which is equivalent to:
-                    #    output = poly(W*x+b) = a0 + a1*(W*x+b) + a2*(W*x+b)^2 + ...
-                    if self.debug.get('print_activation_replacement_debug', False):
-                        print(f"Replacing activation in layer {layer.name}")
-
-                    # Store original weights if the layer has them
-                    original_weights = layer.get_weights() if hasattr(layer, 'get_weights') else None
-
+                if has_activation_in_config and config['activation'] == self.config['activation_type_to_replace']:
                     # Remove activation from config
                     original_activation = config['activation']
                     config['activation'] = 'linear'
 
+                    if self.debug.get('print_activation_replacement_debug', False):
+                        print(f"Splitting activation in layer {layer.name}")
+
                     # Clone layer without activation
                     new_layer = layer.__class__.from_config(config)
 
-                    # Restore original weights
-                    try:
-                        if isinstance(layer, tf.keras.layers.Activation):
-                            input_shape = layer.input.shape
-                            new_layer.build(input_shape)
-                        else:
-                            new_layer.build(layer.input_shape)
-                    except AttributeError as e:
-                        print(f"Warning: Could not build layer {layer.name} due to missing shape information")
-                        print(f"Layer type: {type(layer)}")
-                        print(f"Error: {e}")
-                        raise
+                    # Build and set weights only if the layer has weights
+                    if layer.get_weights() and hasattr(layer, 'input_shape'):
+                        new_layer.build(layer.input_shape)
+                        new_layer.set_weights(layer.get_weights())
+                    # Another approach might be:
+                    # weight_layers = (
+                        # tf.keras.layers.Dense,
+                        # tf.keras.layers.Conv2D,
+                        # tf.keras.layers.BatchNormalization,
+                        # Add other layer types as needed
+                    # )
+                    # if isinstance(layer, weight_layers):
+                        # new_layer.build(layer.input_shape)
+                        # new_layer.set_weights(layer.get_weights())
 
-                    # Add the new layer
-                    x = new_layer(layer_input)
+                    # Append the new layer
                     new_layers.append(new_layer)
 
-                    # Create the new activation layer with the same name
+                    # Create new activation layer
                     activation_layer = tf.keras.layers.Activation(
                         activation=original_activation,
                         name=f"{layer.name}_activation"
                     )
-                    x = activation_layer(x)
                     new_layers.append(activation_layer)
 
                     # Save the pair for replacement during retraining
                     self.activation_layer_pairs.append((new_layer, activation_layer))
                 else:
-                    # Layers with activations not being replaced
-                    x = layer(layer_input)
+                    # Append the layer as-is
                     new_layers.append(layer)
-            else:
-                # Layers without activations
-                x = layer(layer_input)
-                new_layers.append(layer)
 
-            # Store the output tensor
-            layer_outputs[layer.output] = x
+            # Create a new Sequential model
+            new_model = tf.keras.Sequential(new_layers, name=self.model.name)
 
+            # Update the model reference
+            self.model = new_model
+
+        else:
             if self.debug.get('print_network_split_debug', False):
-                print(f"Layer {layer.name} output stored.")
+                print("Model is Functional.")
 
-        # Create new model
-        new_model = tf.keras.Model(inputs=inputs, outputs=x)
-        self.model = new_model
+            # Define the clone function
+            def clone_function(layer):
+                # Get layer config
+                config = layer.get_config()
+
+                # Check if the layer has an 'activation' in its config
+                has_activation_in_config = (
+                    'activation' in config and
+                    config['activation'] is not None and
+                    config['activation'] != 'linear'
+                )
+
+                if has_activation_in_config and config['activation'] == self.config['activation_type_to_replace']:
+                    # Remove activation from config
+                    original_activation = config['activation']
+                    config['activation'] = 'linear'
+
+                    if self.debug.get('print_activation_replacement_debug', False):
+                        print(f"Splitting activation in layer {layer.name}")
+
+                    # Clone the layer without activation
+                    new_layer = layer.__class__.from_config(config)
+
+                    # Return a function that applies the layer and then adds the new activation layer
+                    def apply_new_layer(inputs):
+                        x = new_layer(inputs)
+                        activation_layer = tf.keras.layers.Activation(
+                            activation=original_activation,
+                            name=f"{layer.name}_activation"
+                        )
+                        x = activation_layer(x)
+                        # Save the pair for replacement during retraining
+                        self.activation_layer_pairs.append((new_layer, activation_layer))
+                        return x
+
+                    return apply_new_layer
+
+                # Return the layer as-is
+                return layer
+
+            # Clone the model using the custom clone_function
+            new_model = tf.keras.models.clone_model(
+                self.model,
+                clone_function=clone_function
+            )
+
+            # Copy weights from the original model to the new model
+            new_model.set_weights(self.model.get_weights())
+
+            # Update the model reference
+            self.model = new_model
 
         if self.debug.get('print_network_split_debug', False):
             print("Finished split_activation_layers")
 
-        return new_model
+        return self.model
         
     def replace_all_activations(self, original_activation_function: Callable, replacement_activation_function: Callable) -> 'ModelWrapper':
         replacements_made = 0
@@ -421,14 +413,14 @@ class ModelWrapper:
         layer_before.add_before(tf.keras.layers.BatchNormalization())
         return self
 
-    def retrain(self, train_data: np.ndarray, train_labels: np.ndarray, retrain_type: str = 'iterative'):
+    def retrain(self, train_data: np.ndarray, train_labels: np.ndarray, retrain_type: RetrainType):
         """
         Retrain the model using the specified strategy.
 
         Args:
             train_data: Training data.
             train_labels: Training labels.
-            retrain_type: One of 'all', 'iterative', or 'batched'.
+            retrain_type: RetrainType enum value.
 
         Returns:
             A dictionary containing training histories.
@@ -449,11 +441,11 @@ class ModelWrapper:
 
         history = {}
 
-        if retrain_type == 'all':
+        if retrain_type == RetrainType.ALL:
             history = self._retrain_all(train_dataset, val_dataset)
-        elif retrain_type == 'iterative':
+        elif retrain_type == RetrainType.ITERATIVE:
             history = self._retrain_iterative(train_dataset, val_dataset)
-        elif retrain_type == 'batched':
+        elif retrain_type == RetrainType.BATCHED:
             history = self._retrain_batched(train_dataset, val_dataset)
         else:
             raise ValueError(f"Unknown retrain_type: {retrain_type}")
@@ -783,6 +775,8 @@ class ModelWrapper:
 
     def get_activation_layers(self) -> List[tf.keras.layers.Layer]:
         """Get a list of activation layers that are to be replaced."""
+        self._validate_activation_replacement()
+        
         activation_layers = []
         for layer in self.model.layers:
             if isinstance(layer, tf.keras.layers.Activation):
@@ -830,3 +824,10 @@ class ModelWrapper:
             new_instance.model.set_weights(self.model.get_weights())
         
         return new_instance
+
+    def _validate_activation_replacement(self):
+        """Validate that necessary activation replacement parameters are set."""
+        if self.activation_function is None:
+            raise ValueError("activation_function must be set before performing activation replacement operations")
+        if self.activation_function_to_replace is None:
+            raise ValueError("activation_function_to_replace must be set (either through config or directly) before performing activation replacement operations")
