@@ -66,7 +66,7 @@ class ModelWrapper:
         self.input_shape = input_shape
         self.config = self._load_config(config_path)
         self.activation_function = None
-        self.activation_function_to_replace = self.config.get('activation_type_to_replace', None)
+        self.activation_function_to_replace = self.config.get('activation_type_to_replace')
         self.activation_layer_pairs = []  # List of (original_layer, activation_layer) tuples
         self.model_kwargs = model_kwargs  # Store additional kwargs
 
@@ -87,6 +87,9 @@ class ModelWrapper:
         # If config contains activation type to replace, set it
         if 'activation_type_to_replace' in self.config:
             self.activation_function_to_replace = self.config['activation_type_to_replace']
+
+        if self.activation_function_to_replace is None:
+            raise ValueError("activation_type_to_replace must be specified in the config.")
 
     def save(self, model_path: str) -> None:
         """Save the model"""
@@ -413,25 +416,35 @@ class ModelWrapper:
         layer_before.add_before(tf.keras.layers.BatchNormalization())
         return self
 
-    def retrain(self, train_data: np.ndarray, train_labels: np.ndarray, retrain_type: RetrainType):
+    def retrain(self, train_data: np.ndarray, train_labels: np.ndarray) -> dict:
         """
-        Retrain the model using the specified strategy.
+        Retrain the model using the specified strategy from config.
 
         Args:
             train_data: Training data.
             train_labels: Training labels.
-            retrain_type: RetrainType enum value.
 
         Returns:
             A dictionary containing training histories.
         """
         from tensorflow.keras.callbacks import History
 
-        # Prepare datasets
-        batch_size = self.config['training']['batch_size']
-        validation_split = self.config['training']['validation_split']
+        # Validate activation function settings
+        self._validate_activation_replacement()
 
-        # Split data
+        # Retrieve retraining configuration
+        retraining_config = self.config.get('retraining', {})
+        retraining_type = retraining_config.get('retraining_type')
+
+        if retraining_type not in ['all', 'iterative', 'batched']:
+            raise ValueError(f"Unsupported retraining_type: {retraining_type}")
+
+        batch_size = retraining_config.get('batch_size', 32)
+        activation_replacement_batch_size = retraining_config.get('activation_replacement_batch_size', 1)
+        epochs = retraining_config.get('epochs', 5)
+
+        # Prepare datasets
+        validation_split = self.config['training'].get('validation_split', 0.1)
         split_index = int(len(train_data) * (1 - validation_split))
         x_train, x_val = train_data[:split_index], train_data[split_index:]
         y_train, y_val = train_labels[:split_index], train_labels[split_index:]
@@ -441,28 +454,27 @@ class ModelWrapper:
 
         history = {}
 
-        if retrain_type == RetrainType.ALL:
-            history = self._retrain_all(train_dataset, val_dataset)
-        elif retrain_type == RetrainType.ITERATIVE:
-            history = self._retrain_iterative(train_dataset, val_dataset)
-        elif retrain_type == RetrainType.BATCHED:
-            history = self._retrain_batched(train_dataset, val_dataset)
-        else:
-            raise ValueError(f"Unknown retrain_type: {retrain_type}")
+        if retraining_type == 'all':
+            history = self._retrain_all(train_dataset, val_dataset, epochs)
+        elif retraining_type == 'iterative':
+            history = self._retrain_iterative(train_dataset, val_dataset, epochs)
+        elif retraining_type == 'batched':
+            history = self._retrain_batched(train_dataset, val_dataset, activation_replacement_batch_size, epochs)
 
         return history
 
-    def _retrain_all(self, train_dataset, val_dataset):
+    def _retrain_all(self, train_dataset, val_dataset, epochs):
         """Retrain all layers at once."""
         history = {}
-        config = self.config['retraining']['all_mode']
-        total_epochs = 0
-
-        if config['train_before_activation']:
-            epochs = config['epochs']
-            optimizer = self.get_optimizer(learning_rate_scale=0.1)
+        # Assuming 'all_mode' parameters are now part of the unified config
+        # Retrieve any specific settings if needed
+        config = self.config['retraining']
+        
+        # Optional: Train before activation replacement
+        if config.get('train_before_activation', False):
+            print("Training before activation replacement...")
             self.model.compile(
-                optimizer=optimizer,
+                optimizer=self.get_optimizer(),
                 loss=self.config['training']['loss'],
                 metrics=self.config['training']['metrics']
             )
@@ -472,16 +484,18 @@ class ModelWrapper:
                 validation_data=val_dataset
             )
             history['train_before_activation'] = hist_before.history
-            total_epochs += epochs
 
-        # Replace activations
-        self.replace_all_activations(self.activation_function_to_replace, self.activation_function)
+        # Replace all specified activations
+        print("Replacing all specified activation functions...")
+        for activation_layer in self.get_activation_layers():
+            self.replace_activation(activation_layer, self.activation_function)
 
-        if config['train_after_activation']:
-            epochs = config['epochs']
-            optimizer = self.get_optimizer(learning_rate_scale=0.1)
+        # Optional: Train after activation replacement
+        if config.get('train_after_activation', False):
+            print("Training after activation replacement...")
+            self.reset_optimizer(learning_rate_scale=0.1)  # Assuming this method resets the optimizer appropriately
             self.model.compile(
-                optimizer=optimizer,
+                optimizer=self.get_optimizer(),
                 loss=self.config['training']['loss'],
                 metrics=self.config['training']['metrics']
             )
@@ -491,14 +505,12 @@ class ModelWrapper:
                 validation_data=val_dataset
             )
             history['train_after_activation'] = hist_after.history
-            total_epochs += epochs
 
         return history
 
-    def _retrain_iterative(self, train_dataset, val_dataset):
+    def _retrain_iterative(self, train_dataset, val_dataset, epochs):
         """Iteratively retrain layers."""
         history = {'iterative': []}
-        config = self.config['retraining']['iterative_mode']
         activation_layers = self.get_activation_layers()
 
         for idx, activation_layer in enumerate(activation_layers):
@@ -536,78 +548,88 @@ class ModelWrapper:
                 metrics=self.config['training']['metrics']
             )
 
-            # Retrain
-            epochs = config['epochs']
+            # Train the model
+            print(f"Retraining after replacing activation in layer {activation_layer.name}...")
             hist = self.model.fit(
                 train_dataset,
                 epochs=epochs,
                 validation_data=val_dataset
             )
 
-            # Collect history
-            step_history = {
+            # Record history
+            history_entry = {
                 'layer': idx,
-                'phase': 'iteration',
+                'phase': 'post_activation_replacement',
                 'history': hist.history
             }
-            history['iterative'].append(step_history)
+            history['iterative'].append(history_entry)
 
         return history
 
-    def _retrain_batched(self, train_dataset, val_dataset):
-        """Retrain layers in batches."""
+    def _retrain_batched(self, train_dataset, val_dataset, activation_replacement_batch_size, epochs):
+        """Batched retraining based on activation_replacement_batch_size."""
         history = {'batched': []}
-        config = self.config['retraining']['batched_mode']
-        batch_size = config['batch_size']
         activation_layers = self.get_activation_layers()
-
-        num_batches = (len(activation_layers) + batch_size - 1) // batch_size
+        num_batches = (len(activation_layers) + activation_replacement_batch_size - 1) // activation_replacement_batch_size
 
         for batch_idx in range(num_batches):
-            batch_history = {}
-            start_idx = batch_idx * batch_size
-            end_idx = min((batch_idx + 1) * batch_size, len(activation_layers))
+            start_idx = batch_idx * activation_replacement_batch_size
+            end_idx = min((batch_idx + 1) * activation_replacement_batch_size, len(activation_layers))
             batch_layers = activation_layers[start_idx:end_idx]
 
-            if config['train_before_activation']:
-                epochs = config['epochs']
-                self.model.compile(
-                    optimizer='adam',
-                    loss='categorical_crossentropy',
-                    metrics=['accuracy']
-                )
-                hist_before = self.model.fit(
-                    train_dataset,
-                    epochs=epochs,
-                    validation_data=val_dataset
-                )
-                batch_history['batch'] = batch_idx
-                batch_history['phase'] = 'before'
-                batch_history['history'] = hist_before.history
-                history['batched'].append(batch_history)
+            if self.debug.get('print_retrain_debug', False):
+                print(f"\nProcessing batch {batch_idx + 1}/{num_batches}")
 
-            # Replace activations in batch
+            # Replace activations in this batch
             for activation_layer in batch_layers:
                 self.replace_activation(activation_layer, self.activation_function)
+                if self.debug.get('print_retrain_debug', False):
+                    print(f"Replaced activation in layer: {activation_layer.name}")
 
-            if config['train_after_activation']:
-                epochs = config['epochs']
-                self.reset_optimizer(learning_rate_scale=0.1)
-                self.model.compile(
-                    optimizer='adam',
-                    loss='categorical_crossentropy',
-                    metrics=['accuracy']
-                )
-                hist_after = self.model.fit(
-                    train_dataset,
-                    epochs=epochs,
-                    validation_data=val_dataset
-                )
-                batch_history = {}
-                batch_history['batch'] = batch_idx
-                batch_history['phase'] = 'after'
-                batch_history['history'] = hist_after.history
-                history['batched'].append(batch_history)
+            # Reset all layers to non-trainable
+            for layer in self.model.layers:
+                layer.trainable = False
+
+            # Find and set trainable layers for current batch
+            for activation_layer in batch_layers:
+                prev_layer = self.get_trainable_layer_before(activation_layer)
+                next_layer = self.get_trainable_layer_after(activation_layer)
+
+                if prev_layer:
+                    prev_layer.trainable = True
+                    if self.debug.get('print_retrain_debug', False):
+                        print(f"Training layer before activation: {prev_layer.name}")
+
+                if next_layer:
+                    next_layer.trainable = True
+                    if self.debug.get('print_retrain_debug', False):
+                        print(f"Training layer after activation: {next_layer.name}")
+
+            # Create optimizer with scaled learning rate
+            optimizer = self.get_optimizer(learning_rate_scale=0.1)
+
+            # Compile the model
+            self.model.compile(
+                optimizer=optimizer,
+                loss=self.config['training']['loss'],
+                metrics=self.config['training']['metrics']
+            )
+
+            # Train the model
+            print(f"Retraining batch {batch_idx + 1}/{num_batches}...")
+            hist = self.model.fit(
+                train_dataset,
+                epochs=epochs,
+                validation_data=val_dataset
+            )
+
+            # Record history
+            history_entry = {
+                'batch': batch_idx,
+                'phase': 'post_activation_replacement',
+                'history': hist.history
+            }
+            history['batched'].append(history_entry)
 
         return history
 
@@ -827,7 +849,7 @@ class ModelWrapper:
 
     def _validate_activation_replacement(self):
         """Validate that necessary activation replacement parameters are set."""
-        if self.activation_function is None:
-            raise ValueError("activation_function must be set before performing activation replacement operations")
         if self.activation_function_to_replace is None:
-            raise ValueError("activation_function_to_replace must be set (either through config or directly) before performing activation replacement operations")
+            raise ValueError("activation_type_to_replace must be set in the config before performing activation replacement operations.")
+        if self.activation_function is None:
+            raise ValueError("activation_function must be set before performing activation replacement operations.")

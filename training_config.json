@@ -10,19 +10,10 @@
     "validation_split": 0.1
   },
   "retraining": {
-    "batch_mode": {
-      "batch_size": 32,
-      "activation_replacement_batch_size": 1,
-      "epochs": 5
-    },
-    "iterative_mode": {
-      "batch_size": 32,
-      "epochs": 5
-    },
-    "all_mode": {
-      "batch_size": 32,
-      "epochs": 5
-    }
+    "retraining_type": "iterative",
+    "batch_size": 32,
+    "activation_replacement_batch_size": 1,
+    "epochs": 5
   },
   "prediction_decoder": {
     "top_k": 1000

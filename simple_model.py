@@ -63,7 +63,7 @@ def generate_analysis_report(
         plt.close()
 
         # Page 3 onwards: Modified Model Training Metrics
-        retrain_type = modified_model.config['retraining']['approach']
+        retrain_type = modified_model.config['retraining']['retraining_type']
 
         if retrain_type == 'all':
             # Handle 'all' retraining strategy
@@ -71,7 +71,7 @@ def generate_analysis_report(
                 if phase in modified_history:
                     hist = modified_history[phase]
                     plt.figure(figsize=(12, 6))
-                    epochs = range(len(hist['loss']))
+                    epochs = range(1, len(hist['loss']) + 1)
                     plt.plot(epochs, hist['loss'], label='Training Loss')
                     plt.plot(epochs, hist['val_loss'], label='Validation Loss')
                     plt.plot(epochs, hist['accuracy'], label='Training Accuracy')
@@ -91,12 +91,12 @@ def generate_analysis_report(
                 layer_idx = entry['layer']
                 phase = entry['phase']
                 plt.figure(figsize=(12, 6))
-                epochs = range(len(hist['loss']))
+                epochs = range(1, len(hist['loss']) + 1)
                 plt.plot(epochs, hist['loss'], label='Training Loss')
                 plt.plot(epochs, hist['val_loss'], label='Validation Loss')
                 plt.plot(epochs, hist['accuracy'], label='Training Accuracy')
                 plt.plot(epochs, hist['val_accuracy'], label='Validation Accuracy')
-                plt.title(f'Iterative Retraining (Layer {layer_idx + 1}, {phase.title()})')
+                plt.title(f'Iterative Retraining (Layer {layer_idx + 1}, {phase.replace("_", " ").title()})')
                 plt.xlabel('Epoch')
                 plt.ylabel('Metric')
                 plt.legend()
@@ -111,12 +111,12 @@ def generate_analysis_report(
                 batch_idx = entry['batch']
                 phase = entry['phase']
                 plt.figure(figsize=(12, 6))
-                epochs = range(len(hist['loss']))
+                epochs = range(1, len(hist['loss']) + 1)
                 plt.plot(epochs, hist['loss'], label='Training Loss')
                 plt.plot(epochs, hist['val_loss'], label='Validation Loss')
                 plt.plot(epochs, hist['accuracy'], label='Training Accuracy')
                 plt.plot(epochs, hist['val_accuracy'], label='Validation Accuracy')
-                plt.title(f'Batched Retraining (Batch {batch_idx + 1}, {phase.title()})')
+                plt.title(f'Batched Retraining (Batch {batch_idx + 1}, {phase.replace("_", " ").title()})')
                 plt.xlabel('Epoch')
                 plt.ylabel('Metric')
                 plt.legend()
@@ -195,6 +195,8 @@ def generate_analysis_report(
         plt.text(0.01, 0.99, summary_text, fontsize=10, va='top', ha='left')
         pdf.savefig()
         plt.close()
+
+    print(f"Analysis report saved to {output_path}")
 
 def create_simple_model(input_shape, regularizer=None):
     model = tf.keras.Sequential()
@@ -322,8 +324,7 @@ print("Retraining the modified model using existing retraining strategies...")
 try:
     modified_history = modified_model.retrain(
         X_train, 
-        y_train, 
-        RetrainType.ITERATIVE
+        y_train
     )
 except KeyboardInterrupt:
     print("Retraining interrupted by user. Saving current model weights...")
