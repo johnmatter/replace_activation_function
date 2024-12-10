@@ -2,12 +2,9 @@ import matplotlib.pyplot as plt
 import numpy as np
 import tensorflow as tf
 from tensorflow.keras import regularizers
-from tensorflow.keras.layers import Dense, Activation, Input
-from tensorflow.keras.models import Model
-import copy
 
 from ActivationFunction import ActivationFunctionFactory, ApproximationType
-from ModelWrapper import ModelWrapper, RetrainType
+from ModelWrapper import ModelWrapper
 
 def generate_analysis_report(
     original_model: ModelWrapper,
@@ -204,21 +201,28 @@ def create_simple_model(input_shape, regularizer=None):
     # Add Input layer
     model.add(tf.keras.layers.Input(shape=input_shape))
     
-    # First Dense layer
+    # Add BatchNormalization at the start
+    model.add(tf.keras.layers.BatchNormalization())
+    
+    # First Dense layer - make it wider
+    if regularizer is not None:
+        model.add(tf.keras.layers.Dense(128, kernel_regularizer=regularizer))
+    else:
+        model.add(tf.keras.layers.Dense(128))
+    
+    model.add(tf.keras.layers.BatchNormalization())
+    model.add(tf.keras.layers.Activation('relu'))
+    model.add(tf.keras.layers.Dropout(0.3))
+    
+    # Second Dense layer
     if regularizer is not None:
         model.add(tf.keras.layers.Dense(64, kernel_regularizer=regularizer))
     else:
         model.add(tf.keras.layers.Dense(64))
     
+    model.add(tf.keras.layers.BatchNormalization())
     model.add(tf.keras.layers.Activation('relu'))
-    
-    # Second Dense layer
-    if regularizer is not None:
-        model.add(tf.keras.layers.Dense(32, kernel_regularizer=regularizer))
-    else:
-        model.add(tf.keras.layers.Dense(32))
-    
-    model.add(tf.keras.layers.Activation('relu'))
+    model.add(tf.keras.layers.Dropout(0.2))
     
     # Output layer
     model.add(tf.keras.layers.Dense(2, activation='softmax'))
@@ -227,12 +231,12 @@ def create_simple_model(input_shape, regularizer=None):
 
 # Generate synthetic data with two Gaussian clusters per class
 np.random.seed(42)
-n_samples = 10000
+n_samples = 100000
 n_features = 4
 
 # Class 0: Two Gaussian clusters
-X0_cluster1 = np.random.normal(loc=-2, scale=0.5, size=(n_samples//4, n_features))
-X0_cluster2 = np.random.normal(loc=2, scale=0.5, size=(n_samples//4, n_features))
+X0_cluster1 = np.random.normal(loc=-5, scale=0.5, size=(n_samples//4, n_features))
+X0_cluster2 = np.random.normal(loc=5, scale=0.5, size=(n_samples//4, n_features))
 X0 = np.vstack([X0_cluster1, X0_cluster2])
 
 # Class 1: One Gaussian cluster
@@ -252,7 +256,7 @@ y_train = y_train[shuffle_idx]
 y_train = tf.keras.utils.to_categorical(y_train, num_classes=2)
 
 # Define the regularizer
-l2_regularizer = regularizers.l2(0.01)
+l2_regularizer = regularizers.l2(0.001)
 
 # Initialize original model
 print("Loading original model...")
@@ -281,8 +285,9 @@ original_model.model.compile(
 # Create early stopping callback
 early_stopping = tf.keras.callbacks.EarlyStopping(
     monitor='val_loss',
-    patience=3,
-    restore_best_weights=True
+    patience=5,
+    restore_best_weights=True,
+    min_delta=0.001
 )
 
 # Train original model
@@ -329,6 +334,9 @@ try:
 except KeyboardInterrupt:
     print("Retraining interrupted by user. Saving current model weights...")
     modified_model.model.save_weights("modified_model_weights.h5")
+
+# After generating X_train
+X_train = (X_train - np.mean(X_train, axis=0)) / np.std(X_train, axis=0)
 
 # Generate analysis report
 generate_analysis_report(
