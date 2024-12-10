@@ -15,6 +15,7 @@ from transformers import (
 )
 from PIL import Image
 import time
+import copy
 
 from PredictionDecoder import PredictionDecoder
 
@@ -33,7 +34,7 @@ from PredictionDecoder import PredictionDecoder
 class RetrainType(Enum):
     """Enum for different types of retraining"""
     ALL = "all"
-    BATCHED = "batched"
+    BATCHEDger = "batched"
     ITERATIVE = "iterative"
 
 class ModelWrapper:
@@ -45,16 +46,18 @@ class ModelWrapper:
         model_class: Optional[Any] = None, 
         processor_class: Optional[Any] = None, 
         is_huggingface: bool = True,
-        input_shape: Tuple[int, int, int] = (224, 224, 3),
-        config_path: Optional[str] = None
+        input_shape: Tuple[int, ...] = (224, 224, 3),
+        config_path: Optional[str] = None,
+        **model_kwargs
     ) -> None:
-        # Enable eager execution at the start
-        tf.config.run_functions_eagerly(True)
+
+        # # Enable eager execution at the start
+        # tf.config.run_functions_eagerly(True)
         
         # Initialize model-specific attributes
         self.model_name = model_name
         self.model_type = model_type
-        self.debug = debug
+        self.debug = debug or {}
         self.model = None
         self.processor = None
         self.activation_function = None
@@ -64,6 +67,7 @@ class ModelWrapper:
         self.input_shape = input_shape
         self.config = self._load_config(config_path)
         self.activation_layer_pairs = []  # List of (original_layer, activation_layer) tuples
+        self.model_kwargs = model_kwargs  # Store additional kwargs
 
         # Initialize compilation settings
         self.base_settings = {
@@ -122,7 +126,9 @@ class ModelWrapper:
             if self.model_class is not None:
                 if callable(self.model_class) and not isinstance(self.model_class, type):
                     # Handle custom model function
-                    self.model = self.model_class()
+                    print("Creating custom model with input_shape and model_kwargs...")
+                    print(f"model_kwargs: {self.model_kwargs}")  # Debugging
+                    self.model = self.model_class(self.input_shape, **self.model_kwargs)
                 else:
                     # Handle built-in Keras models
                     if self.model_type == "image":
@@ -139,6 +145,7 @@ class ModelWrapper:
             else:
                 raise ValueError("Model class must be provided")
         
+        print("Model created successfully.")
         return self
 
     def split_activation_layers(self) -> tf.keras.Model:
@@ -165,8 +172,11 @@ class ModelWrapper:
         else:
             raise ValueError("This model type is not currently supported for activation splitting")
         
-        inputs = base_model.input
-        if inputs is None:
+        # TODO: fix this error. compare https://github.com/tensorflow/tensorflow/issues/30770
+        # AttributeError: The layer sequential_1 has never been called and thus has no defined input.. Did you mean: 'inputs'?
+        try:
+            inputs = base_model.input
+        except AttributeError:
             raise ValueError("The model has no inputs defined. Ensure the model is properly initialized.")
         
         x = inputs
@@ -311,14 +321,16 @@ class ModelWrapper:
 
         return self
 
-    def replace_activation(self, layer, new_activation):
-        """Replace activation function and add regularization"""
-        if hasattr(layer, 'activation'):
-            layer.activation = new_activation
-            
-            # Add L2 regularization to kernel if available
-            if hasattr(layer, 'kernel_regularizer'):
-                layer.kernel_regularizer = tf.keras.regularizers.l2(1e-4)
+    def replace_activation(self, activation_layer, new_activation):
+        """Replace the activation function of an Activation layer."""
+        if isinstance(activation_layer, tf.keras.layers.Activation):
+            if self.debug.get('print_activation_replacement_debug', False):
+                print(f"Replacing activation in layer {activation_layer.name}")
+            activation_layer.activation = new_activation
+
+            # # Add L2 regularization to kernel if available
+            # if hasattr(layer, 'kernel_regularizer'):
+            #     layer.kernel_regularizer = tf.keras.regularizers.l2(1e-4)
 
     def preprocess(self, inputs):
         if self.is_huggingface:
@@ -378,24 +390,25 @@ class ModelWrapper:
                 return layers[i + 1]
         return None
     
-    def get_trainable_layer_before(self, activation_layer: tf.keras.layers.Layer) -> Optional[tf.keras.layers.Layer]:
-        """Get the first trainable layer before the given activation layer"""
-        layer = self.get_layer_before(activation_layer)
-        # We can't check the trainable attribute, because we just set it to False.
-        # We should check for weights instead.  
-        while layer is not None and len(layer.weights) == 0:
-            layer = self.get_layer_before(layer)
-        return layer
+    def get_trainable_layer_before(self, target_layer):
+        """Find the first trainable layer before the target layer."""
+        target_index = self.model.layers.index(target_layer)
+        for layer in reversed(self.model.layers[:target_index]):
+            if self.is_trainable_layer(layer):
+                return layer
+        return None
 
-    def get_trainable_layer_after(self, activation_layer: tf.keras.layers.Layer) -> Optional[tf.keras.layers.Layer]:
-        """Get the first trainable layer after the given activation layer"""
-        layer = self.get_layer_after(activation_layer)
-        # We can't check the trainable attribute, because we just set it to False.
-        # We should check for weights instead.  
-        while layer is not None and len(layer.weights) == 0:
-            layer = self.get_layer_after(layer)
-        return layer
+    def get_trainable_layer_after(self, target_layer):
+        """Find the first trainable layer after the target layer."""
+        target_index = self.model.layers.index(target_layer)
+        for layer in self.model.layers[target_index + 1:]:
+            if self.is_trainable_layer(layer):
+                return layer
+        return None
 
+    def is_trainable_layer(self, layer):
+        """Determine if a layer is trainable."""
+        return hasattr(layer, 'trainable') and isinstance(layer, (tf.keras.layers.Dense, tf.keras.layers.Conv2D))
 
     def add_layer_before(self, layer: tf.keras.layers.Layer, new_layer: tf.keras.layers.Layer) -> 'ModelWrapper':
         """Add a layer before the specified layer"""
@@ -408,199 +421,203 @@ class ModelWrapper:
         layer_before.add_before(tf.keras.layers.BatchNormalization())
         return self
 
-    def retrain(self, train_data: np.ndarray, train_labels: np.ndarray, retrain_type: RetrainType = RetrainType.ITERATIVE) -> 'ModelWrapper':
-        """Retrain the model with the specified approach"""
-        training_config = self.config['training']
-        
+    def retrain(self, train_data: np.ndarray, train_labels: np.ndarray, retrain_type: str = 'iterative'):
+        """
+        Retrain the model using the specified strategy.
+
+        Args:
+            train_data: Training data.
+            train_labels: Training labels.
+            retrain_type: One of 'all', 'iterative', or 'batched'.
+
+        Returns:
+            A dictionary containing training histories.
+        """
+        from tensorflow.keras.callbacks import History
+
         # Prepare datasets
-        train_dataset, val_dataset = self.prepare_data(train_data, train_labels)
-        
-        # Debug dataset structure
-        print("\nDebugging dataset structure:")
-        for x, y in train_dataset.take(1):
-            print(f"Input shape: {x.shape}")
-            print(f"Label shape: {y.shape}")
-            print(f"Input dtype: {x.dtype}")
-            print(f"Label dtype: {y.dtype}")
-        
-        # Configure optimizer
-        optimizer_name = training_config['optimizer'].lower()
-        if optimizer_name == 'adam':
-            optimizer = tf.keras.optimizers.Adam(
-                learning_rate=training_config['learning_rate']
-            )
+        batch_size = self.config['training']['batch_size']
+        validation_split = self.config['training']['validation_split']
+
+        # Split data
+        split_index = int(len(train_data) * (1 - validation_split))
+        x_train, x_val = train_data[:split_index], train_data[split_index:]
+        y_train, y_val = train_labels[:split_index], train_labels[split_index:]
+
+        train_dataset = tf.data.Dataset.from_tensor_slices((x_train, y_train)).batch(batch_size)
+        val_dataset = tf.data.Dataset.from_tensor_slices((x_val, y_val)).batch(batch_size)
+
+        history = {}
+
+        if retrain_type == 'all':
+            history = self._retrain_all(train_dataset, val_dataset)
+        elif retrain_type == 'iterative':
+            history = self._retrain_iterative(train_dataset, val_dataset)
+        elif retrain_type == 'batched':
+            history = self._retrain_batched(train_dataset, val_dataset)
         else:
-            raise ValueError(f"Unsupported optimizer: {optimizer_name}")
+            raise ValueError(f"Unknown retrain_type: {retrain_type}")
 
-        # Debug model structure
-        print("\nDebugging model structure:")
-        print(f"Model input shape: {self.model.input_shape}")
-        print(f"Model output shape: {self.model.output_shape}")
-        
-        # Configure base model compilation settings
-        self.base_compile_settings = {
-            'optimizer': optimizer,
-            'loss': tf.keras.losses.CategoricalCrossentropy(from_logits=False),  # Changed from_logits to False
-            'metrics': [tf.keras.metrics.CategoricalAccuracy(name='accuracy')],
-            'jit_compile': False
-        }
-        
-        # Initial compilation
-        self.model.compile(**self.base_compile_settings)
-        
-        # Execute retraining strategy
-        if retrain_type == RetrainType.ITERATIVE:
-            self._retrain_iterative(train_dataset, val_dataset)
-        elif retrain_type == RetrainType.ALL:
-            self._retrain_all(train_dataset, val_dataset)
-        elif retrain_type == RetrainType.BATCHED:
-            self._retrain_batched(train_dataset, val_dataset)
-        
-        return self
+        return history
 
-    def _retrain_iterative(self, train_dataset: tf.data.Dataset, val_dataset: tf.data.Dataset) -> 'ModelWrapper':
-        """Retrain the model iteratively, one activation layer at a time"""
-        config = self.config['retraining']['iterative_mode']
-        
-        for idx, layer_pair in enumerate(self.activation_layer_pairs):
-            print(f"\nProcessing activation layer {idx+1}/{len(self.activation_layer_pairs)}: {layer_pair[1].name}")
-            
-            # 1. Reset all layers to non-trainable
-            self._reset_trainable_layers()
-            
-            # Get the activation layer from the pair
-            activation_layer = layer_pair[1]  # The second element is the activation layer
-            
-            # 2. Get surrounding layers
-            prev_layer = self.get_trainable_layer_before(activation_layer)
-            next_layer = self.get_trainable_layer_after(activation_layer)
-            
-            # 3. Warmup phase - train only surrounding layers
-            if prev_layer:
-                prev_layer.trainable = True
-                print(f"Training layer before {activation_layer.name}: {prev_layer.name}")
-            if next_layer:
-                next_layer.trainable = True
-                print(f"Training layer after {activation_layer.name}: {next_layer.name}")
-                
-            # 4. Replace activation
-            self.replace_activation(activation_layer, self.activation_function)
-            
-            # 5. Compile with very low learning rate for warmup
-            self.reset_optimizer(learning_rate_scale=0.001)
-            self.model.compile(**self.current_compile_settings)
-            
-            # 6. Warmup training
-            self._fit(
-                train_dataset,
-                epochs=2,
-                validation_data=val_dataset,
-                callbacks=self._get_callbacks()
-            )
-            
-            # 7. Main training phase - include more surrounding layers
-            self._gradually_unfreeze_layers(activation_layer, num_layers=2)
-            
-            # 8. Compile with slightly higher learning rate
-            self.reset_optimizer(learning_rate_scale=0.01)
-            self.model.compile(**self.current_compile_settings)
-            
-            # 9. Main training
-            self._fit(
-                train_dataset,
-                epochs=config['epochs'],
-                validation_data=val_dataset,
-                callbacks=self._get_callbacks()
-            )
-        
-        return self
-
-    def _gradually_unfreeze_layers(self, center_layer, num_layers=2):
-        """Unfreeze layers gradually outward from the center layer"""
-        layer_list = self.model.layers
-        center_idx = layer_list.index(center_layer)
-        
-        start_idx = max(0, center_idx - num_layers)
-        end_idx = min(len(layer_list), center_idx + num_layers + 1)
-        
-        for layer in layer_list[start_idx:end_idx]:
-            if isinstance(layer, tf.keras.layers.BatchNormalization):
-                continue  # Keep BN layers frozen
-            layer.trainable = True
-
-    def _retrain_all(self, train_dataset: tf.data.Dataset, val_dataset: tf.data.Dataset) -> 'ModelWrapper':
-        """Retrain the model on all activation layers at once"""
+    def _retrain_all(self, train_dataset, val_dataset):
+        """Retrain all layers at once."""
+        history = {}
         config = self.config['retraining']['all_mode']
-        activation_layers = self.split_activation_layers
-        
-        # 1. Reset all layers to non-trainable
-        for layer in self.model.layers:
-            layer.trainable = False
-        
-        # 2. Make specific layers trainable and replace activations
-        for activation_layer in activation_layers:
-            if config['train_before_activation']:
-                layer_before = self.get_layer_before(activation_layer)
-                layer_before.trainable = True
-            elif config['train_after_activation']:
-                layer_after = self.get_layer_after(activation_layer)
-                layer_after.trainable = True
-            
-            self.replace_activation(activation_layer, self.activation_function)
-        
-        # Reset optimizer with reduced learning rate for fine-tuning
-        self.reset_optimizer(learning_rate_scale=0.01)
-        
-        # Compile with fresh settings
-        self.model.compile(**self.current_compile_settings)
-        
-        # 4. Train once with all replacements
-        self._fit(
-            train_dataset, 
-            epochs=config['epochs'],
-            validation_data=val_dataset
-        )
-        
-        return self
+        total_epochs = 0
 
-    def _retrain_batched(self, train_dataset: tf.data.Dataset, val_dataset: tf.data.Dataset) -> 'ModelWrapper':
-        """Retrain the model in batches of activation layers"""
-        config = self.config['retraining']['batch_mode']
-        activation_layers = self.split_activation_layers
-        
-        for i in range(0, len(activation_layers), config['activation_replacement_batch_size']):
-            # Get current batch of activation layers
-            batch_layers = activation_layers[i:i + config['activation_replacement_batch_size']]
-            
-            # 1. Reset all layers to non-trainable
-            for layer in self.model.layers:
-                layer.trainable = False
-            
-            # 2. Make specific layers trainable and replace activations for this batch
-            for activation_layer in batch_layers:
-                if config['train_before_activation']:
-                    layer_before = self.get_layer_before(activation_layer)
-                    layer_before.trainable = True
-                elif config['train_after_activation']:
-                    layer_after = self.get_layer_after(activation_layer)
-                    layer_after.trainable = True
-                
-                self.replace_activation(activation_layer, self.activation_function)
-            
-            # Reset optimizer with reduced learning rate for fine-tuning
-            self.reset_optimizer(learning_rate_scale=0.01)
-            
-            # Compile with fresh settings
-            self.model.compile(**self.current_compile_settings)
-            
-            # 4. Train on current batch of replacements
-            self._fit(
-                train_dataset, 
-                epochs=config['epochs'],
+        if config['train_before_activation']:
+            epochs = config['epochs']
+            optimizer = self.get_optimizer(learning_rate_scale=0.1)
+            self.model.compile(
+                optimizer=optimizer,
+                loss=self.config['training']['loss'],
+                metrics=self.config['training']['metrics']
+            )
+            hist_before = self.model.fit(
+                train_dataset,
+                epochs=epochs,
                 validation_data=val_dataset
             )
-        
-        return self
+            history['train_before_activation'] = hist_before.history
+            total_epochs += epochs
+
+        # Replace activations
+        self.replace_all_activations(self.activation_function_to_replace, self.activation_function)
+
+        if config['train_after_activation']:
+            epochs = config['epochs']
+            optimizer = self.get_optimizer(learning_rate_scale=0.1)
+            self.model.compile(
+                optimizer=optimizer,
+                loss=self.config['training']['loss'],
+                metrics=self.config['training']['metrics']
+            )
+            hist_after = self.model.fit(
+                train_dataset,
+                epochs=epochs,
+                validation_data=val_dataset
+            )
+            history['train_after_activation'] = hist_after.history
+            total_epochs += epochs
+
+        return history
+
+    def _retrain_iterative(self, train_dataset, val_dataset):
+        """Iteratively retrain layers."""
+        history = {'iterative': []}
+        config = self.config['retraining']['iterative_mode']
+        activation_layers = self.get_activation_layers()
+
+        for idx, activation_layer in enumerate(activation_layers):
+            if self.debug.get('print_retrain_debug', False):
+                print(f"\nProcessing activation layer {idx+1}/{len(activation_layers)}: {activation_layer.name}")
+
+            # Replace activation
+            self.replace_activation(activation_layer, self.activation_function)
+
+            # Reset all layers to non-trainable
+            for layer in self.model.layers:
+                layer.trainable = False
+
+            # Find and set trainable layers
+            prev_layer = self.get_trainable_layer_before(activation_layer)
+            next_layer = self.get_trainable_layer_after(activation_layer)
+
+            if prev_layer:
+                prev_layer.trainable = True
+                if self.debug.get('print_retrain_debug', False):
+                    print(f"Training layer before activation: {prev_layer.name}")
+
+            if next_layer:
+                next_layer.trainable = True
+                if self.debug.get('print_retrain_debug', False):
+                    print(f"Training layer after activation: {next_layer.name}")
+
+            # Create optimizer with scaled learning rate
+            optimizer = self.get_optimizer(learning_rate_scale=0.1)
+
+            # Compile the model
+            self.model.compile(
+                optimizer=optimizer,
+                loss=self.config['training']['loss'],
+                metrics=self.config['training']['metrics']
+            )
+
+            # Retrain
+            epochs = config['epochs']
+            hist = self.model.fit(
+                train_dataset,
+                epochs=epochs,
+                validation_data=val_dataset
+            )
+
+            # Collect history
+            step_history = {
+                'layer': idx,
+                'phase': 'iteration',
+                'history': hist.history
+            }
+            history['iterative'].append(step_history)
+
+        return history
+
+    def _retrain_batched(self, train_dataset, val_dataset):
+        """Retrain layers in batches."""
+        history = {'batched': []}
+        config = self.config['retraining']['batched_mode']
+        batch_size = config['batch_size']
+        activation_layers = self.get_activation_layers()
+
+        num_batches = (len(activation_layers) + batch_size - 1) // batch_size
+
+        for batch_idx in range(num_batches):
+            batch_history = {}
+            start_idx = batch_idx * batch_size
+            end_idx = min((batch_idx + 1) * batch_size, len(activation_layers))
+            batch_layers = activation_layers[start_idx:end_idx]
+
+            if config['train_before_activation']:
+                epochs = config['epochs']
+                self.model.compile(
+                    optimizer='adam',
+                    loss='categorical_crossentropy',
+                    metrics=['accuracy']
+                )
+                hist_before = self.model.fit(
+                    train_dataset,
+                    epochs=epochs,
+                    validation_data=val_dataset
+                )
+                batch_history['batch'] = batch_idx
+                batch_history['phase'] = 'before'
+                batch_history['history'] = hist_before.history
+                history['batched'].append(batch_history)
+
+            # Replace activations in batch
+            for activation_layer in batch_layers:
+                self.replace_activation(activation_layer, self.activation_function)
+
+            if config['train_after_activation']:
+                epochs = config['epochs']
+                self.reset_optimizer(learning_rate_scale=0.1)
+                self.model.compile(
+                    optimizer='adam',
+                    loss='categorical_crossentropy',
+                    metrics=['accuracy']
+                )
+                hist_after = self.model.fit(
+                    train_dataset,
+                    epochs=epochs,
+                    validation_data=val_dataset
+                )
+                batch_history = {}
+                batch_history['batch'] = batch_idx
+                batch_history['phase'] = 'after'
+                batch_history['history'] = hist_after.history
+                history['batched'].append(batch_history)
+
+        return history
 
     def get_input_layer_name(self) -> str:
         """Get the current input layer name of the model"""
@@ -688,24 +705,37 @@ class ModelWrapper:
 
         return train_dataset, val_dataset
 
-    def reset_optimizer(self, learning_rate_scale: float = 1.0):
-        """Reset optimizer with scaled learning rate and update compilation settings"""
-        training_config = self.config['training']
+    def reset_optimizer(self, learning_rate_scale=1.0):
+        """
+        Reset the optimizer with a scaled learning rate.
+        This function assumes that self.current_compile_settings is already set.
+        """
+        training_config = self.current_compile_settings
+
         optimizer_name = training_config['optimizer'].lower()
-        
+
+        # Get current learning rate
+        current_lr = None
+        if hasattr(self.model.optimizer, 'learning_rate'):
+            current_lr = tf.keras.backend.get_value(self.model.optimizer.learning_rate)
+        else:
+            # Default learning rate based on optimizer
+            if optimizer_name == 'adam':
+                current_lr = 0.001
+            elif optimizer_name == 'sgd':
+                current_lr = 0.01
+            else:
+                current_lr = 0.001  # Default fallback
+
+        # Scale learning rate
+        new_lr = current_lr * learning_rate_scale
+
         if optimizer_name == 'adam':
-            optimizer = tf.keras.optimizers.Adam(
-                learning_rate=training_config['learning_rate'] * learning_rate_scale,
-                clipnorm=1.0
-            )
+            self.model.optimizer = tf.keras.optimizers.Adam(learning_rate=new_lr)
+        elif optimizer_name == 'sgd':
+            self.model.optimizer = tf.keras.optimizers.SGD(learning_rate=new_lr)
         else:
             raise ValueError(f"Unsupported optimizer: {optimizer_name}")
-        
-        # Update current compilation settings with new optimizer and base settings
-        self.current_compile_settings = {
-            'optimizer': optimizer,
-            **self.base_settings  # Spread the base settings we defined in __init__
-        }
 
     def _get_callbacks(self):
         return [
@@ -750,3 +780,53 @@ class ModelWrapper:
                 print(f"- {layer.name}: {sum(tf.size(var).numpy() for var in layer.trainable_variables):,} parameters")
         
         return self.model.fit(*args, **kwargs)
+
+    def get_activation_layers(self) -> List[tf.keras.layers.Layer]:
+        """Get a list of activation layers that are to be replaced."""
+        activation_layers = []
+        for layer in self.model.layers:
+            if isinstance(layer, tf.keras.layers.Activation):
+                if layer.activation.__name__ == self.activation_function_to_replace:
+                    activation_layers.append(layer)
+        return activation_layers
+
+    def get_optimizer(self, learning_rate_scale=1.0):
+        """Create optimizer based on config with scaled learning rate."""
+        training_config = self.config['training']
+        optimizer_name = training_config.get('optimizer', 'adam').lower()
+        base_learning_rate = training_config.get('learning_rate', 0.001)
+
+        # Scale the learning rate
+        new_lr = base_learning_rate * learning_rate_scale
+
+        if optimizer_name == 'adam':
+            optimizer = tf.keras.optimizers.Adam(learning_rate=new_lr)
+        elif optimizer_name == 'sgd':
+            optimizer = tf.keras.optimizers.SGD(learning_rate=new_lr)
+        else:
+            raise ValueError(f"Unsupported optimizer: {optimizer_name}")
+
+        return optimizer
+
+    def copy(self) -> 'ModelWrapper':
+        """Create a deep copy of the current ModelWrapper instance."""
+        # Create a new instance with the same configuration
+        new_instance = ModelWrapper(
+            model_name=self.model_name,
+            model_type=self.model_type,
+            model_class=self.model_class,
+            processor_class=self.processor_class,
+            is_huggingface=self.is_huggingface,
+            input_shape=self.input_shape,
+            debug=self.debug.copy(),
+            **copy.deepcopy(self.model_kwargs)
+        )
+        
+        # Create the base model
+        new_instance.create_base_model()
+        
+        # Copy weights if the original model has been trained
+        if self.model is not None:
+            new_instance.model.set_weights(self.model.get_weights())
+        
+        return new_instance

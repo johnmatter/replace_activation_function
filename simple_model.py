@@ -1,31 +1,37 @@
-import tensorflow as tf
+import matplotlib.pyplot as plt
 import numpy as np
+import tensorflow as tf
+from tensorflow.keras import regularizers
 from tensorflow.keras.layers import Dense, Activation, Input
 from tensorflow.keras.models import Model
-from tensorflow.keras.optimizers import Adam
+import copy
+
 from ActivationFunction import ActivationFunctionFactory, ApproximationType
-import matplotlib.pyplot as plt
-from ModelWrapper import ModelWrapper
+from ModelWrapper import ModelWrapper, RetrainType
 
 def generate_analysis_report(
     original_model: ModelWrapper,
     modified_model: ModelWrapper,
     X_train: np.ndarray,
     y_train: np.ndarray,
+    original_history: tf.keras.callbacks.History,
+    modified_history: dict,
     output_path: str = "analysis_report.pdf"
 ) -> None:
     """
     Generate a PDF report comparing original and modified models.
-    
+
     Args:
         original_model: Original ModelWrapper instance
         modified_model: Modified ModelWrapper instance with polynomial approximations
         X_train: Training data
         y_train: Training labels
+        original_history: Training history of the original model
+        modified_history: Training history of the modified model
         output_path: Path to save the PDF report
     """
     from matplotlib.backends.backend_pdf import PdfPages
-    
+
     with PdfPages(output_path) as pdf:
         # Page 1: Data Distribution
         plt.figure(figsize=(8, 6))
@@ -41,7 +47,84 @@ def generate_analysis_report(
         pdf.savefig()
         plt.close()
 
-        # Page 2: Prediction Comparisons
+        # Page 2: Training Metrics - Original Model
+        plt.figure(figsize=(12, 6))
+        epochs = original_history.epoch
+        plt.plot(epochs, original_history.history['loss'], label='Training Loss')
+        plt.plot(epochs, original_history.history['val_loss'], label='Validation Loss')
+        plt.plot(epochs, original_history.history['accuracy'], label='Training Accuracy')
+        plt.plot(epochs, original_history.history['val_accuracy'], label='Validation Accuracy')
+        plt.title('Original Model Training Metrics')
+        plt.xlabel('Epoch')
+        plt.ylabel('Metric')
+        plt.legend()
+        plt.grid(True)
+        pdf.savefig()
+        plt.close()
+
+        # Page 3 onwards: Modified Model Training Metrics
+        retrain_type = modified_model.config['retraining']['approach']
+
+        if retrain_type == 'all':
+            # Handle 'all' retraining strategy
+            for phase in ['train_before_activation', 'train_after_activation']:
+                if phase in modified_history:
+                    hist = modified_history[phase]
+                    plt.figure(figsize=(12, 6))
+                    epochs = range(len(hist['loss']))
+                    plt.plot(epochs, hist['loss'], label='Training Loss')
+                    plt.plot(epochs, hist['val_loss'], label='Validation Loss')
+                    plt.plot(epochs, hist['accuracy'], label='Training Accuracy')
+                    plt.plot(epochs, hist['val_accuracy'], label='Validation Accuracy')
+                    plt.title(f'Modified Model Training Metrics ({phase.replace("_", " ").title()})')
+                    plt.xlabel('Epoch')
+                    plt.ylabel('Metric')
+                    plt.legend()
+                    plt.grid(True)
+                    pdf.savefig()
+                    plt.close()
+
+        elif retrain_type == 'iterative':
+            # Handle 'iterative' retraining strategy
+            for entry in modified_history['iterative']:
+                hist = entry['history']
+                layer_idx = entry['layer']
+                phase = entry['phase']
+                plt.figure(figsize=(12, 6))
+                epochs = range(len(hist['loss']))
+                plt.plot(epochs, hist['loss'], label='Training Loss')
+                plt.plot(epochs, hist['val_loss'], label='Validation Loss')
+                plt.plot(epochs, hist['accuracy'], label='Training Accuracy')
+                plt.plot(epochs, hist['val_accuracy'], label='Validation Accuracy')
+                plt.title(f'Iterative Retraining (Layer {layer_idx + 1}, {phase.title()})')
+                plt.xlabel('Epoch')
+                plt.ylabel('Metric')
+                plt.legend()
+                plt.grid(True)
+                pdf.savefig()
+                plt.close()
+
+        elif retrain_type == 'batched':
+            # Handle 'batched' retraining strategy
+            for entry in modified_history['batched']:
+                hist = entry['history']
+                batch_idx = entry['batch']
+                phase = entry['phase']
+                plt.figure(figsize=(12, 6))
+                epochs = range(len(hist['loss']))
+                plt.plot(epochs, hist['loss'], label='Training Loss')
+                plt.plot(epochs, hist['val_loss'], label='Validation Loss')
+                plt.plot(epochs, hist['accuracy'], label='Training Accuracy')
+                plt.plot(epochs, hist['val_accuracy'], label='Validation Accuracy')
+                plt.title(f'Batched Retraining (Batch {batch_idx + 1}, {phase.title()})')
+                plt.xlabel('Epoch')
+                plt.ylabel('Metric')
+                plt.legend()
+                plt.grid(True)
+                pdf.savefig()
+                plt.close()
+
+        # Page 4: Prediction Comparisons
         num_samples_to_plot = 100
         test_samples = X_train[:num_samples_to_plot]
         original_preds = original_model.model.predict(test_samples)
@@ -71,37 +154,78 @@ def generate_analysis_report(
         pdf.savefig()
         plt.close()
 
-        # Page 3: Model Summary
-        plt.figure(figsize=(8, 10))
-        plt.text(0.1, 0.9, 'Model Comparison Summary', fontsize=14, fontweight='bold')
-        
+        # Page 5: Model Summary
+        from io import StringIO
+        import sys
+
+        # Capture model summaries
+        def capture_model_summary(model):
+            stream = StringIO()
+            sys.stdout = stream
+            model.summary()
+            sys.stdout = sys.__stdout__
+            summary_string = stream.getvalue()
+            stream.close()
+            return summary_string
+
+        original_summary = capture_model_summary(original_model.model)
+        modified_summary = capture_model_summary(modified_model.model)
+
+        # Display model summaries and metrics
+        plt.figure(figsize=(8.5, 11))
+        plt.axis('off')
+        plt.title('Model Comparison Summary', fontsize=14, fontweight='bold')
+
         # Calculate summary statistics
         mean_diff = np.mean(differences)
         max_diff = np.max(differences)
         accuracy_agreement = np.mean(
             original_preds.argmax(axis=1) == modified_preds.argmax(axis=1)
         )
-        
+
         summary_text = (
             f"Number of samples analyzed: {num_samples_to_plot}\n\n"
             f"Mean prediction difference: {mean_diff:.4f}\n"
             f"Maximum prediction difference: {max_diff:.4f}\n"
             f"Prediction agreement rate: {accuracy_agreement:.2%}\n\n"
-            f"Original Model Architecture:\n"
-            f"{original_model.model.summary()}\n\n"
-            f"Modified Model Architecture:\n"
-            f"{modified_model.model.summary()}"
+            f"Original Model Architecture:\n{original_summary}\n\n"
+            f"Modified Model Architecture:\n{modified_summary}"
         )
-        
-        plt.text(0.1, 0.8, summary_text, fontsize=10, 
-                verticalalignment='top', transform=plt.gca().transAxes)
-        plt.axis('off')
+
+        plt.text(0.01, 0.99, summary_text, fontsize=10, va='top', ha='left')
         pdf.savefig()
         plt.close()
 
+def create_simple_model(input_shape, regularizer=None):
+    model = tf.keras.Sequential()
+    
+    # Add Input layer
+    model.add(tf.keras.layers.Input(shape=input_shape))
+    
+    # First Dense layer
+    if regularizer is not None:
+        model.add(tf.keras.layers.Dense(64, kernel_regularizer=regularizer))
+    else:
+        model.add(tf.keras.layers.Dense(64))
+    
+    model.add(tf.keras.layers.Activation('relu'))
+    
+    # Second Dense layer
+    if regularizer is not None:
+        model.add(tf.keras.layers.Dense(32, kernel_regularizer=regularizer))
+    else:
+        model.add(tf.keras.layers.Dense(32))
+    
+    model.add(tf.keras.layers.Activation('relu'))
+    
+    # Output layer
+    model.add(tf.keras.layers.Dense(2, activation='softmax'))
+    
+    return model
+
 # Generate synthetic data with two Gaussian clusters per class
 np.random.seed(42)
-n_samples = 100000
+n_samples = 10000
 n_features = 4
 
 # Class 0: Two Gaussian clusters
@@ -109,7 +233,7 @@ X0_cluster1 = np.random.normal(loc=-2, scale=0.5, size=(n_samples//4, n_features
 X0_cluster2 = np.random.normal(loc=2, scale=0.5, size=(n_samples//4, n_features))
 X0 = np.vstack([X0_cluster1, X0_cluster2])
 
-# Class 1: Two Gaussian clusters
+# Class 1: One Gaussian cluster
 X1_cluster1 = np.random.normal(loc=0, scale=0.5, size=(n_samples//2, n_features))
 y1 = np.ones(n_samples//2)
 
@@ -125,80 +249,84 @@ y_train = y_train[shuffle_idx]
 # Convert to one-hot encoding
 y_train = tf.keras.utils.to_categorical(y_train, num_classes=2)
 
-def create_simple_model():
-    inputs = Input(shape=(4,))
-    x = Dense(8)(inputs)
-    x = Activation('relu')(x)
-    x = Dense(2)(x)
-    outputs = Activation('softmax')(x)
-    return Model(inputs, outputs)
+# Define the regularizer
+l2_regularizer = regularizers.l2(0.01)
 
 # Initialize original model
 print("Loading original model...")
 original_model = ModelWrapper(
     model_name="simple_model",
     model_type="custom",
-    model_class=create_simple_model,  # Pass the function directly
+    model_class=create_simple_model,
+    config_path="training_config.json",
     is_huggingface=False,
     input_shape=(4,),
     debug={
         'print_activation_replacement_debug': True
-    }
+    },
+    regularizer=l2_regularizer  # Pass the regularizer here
 )
 original_model.create_base_model()
 
-# Train original model
+# Compile the original model
 original_model.model.compile(
-    optimizer='adam',
-    loss='categorical_crossentropy',
-    metrics=['accuracy']
-)
-original_model.model.fit(
-    X_train, y_train,
-    epochs=5,
-    batch_size=32,
-    validation_split=0.1
+    optimizer=original_model.config['training']['optimizer'],
+    loss=original_model.config['training']['loss'],
+    metrics=original_model.config['training']['metrics']
 )
 
-# Initialize modified model
-print("\nCreating and training modified model...")
-modified_model = ModelWrapper(
-    model_name="simple_model",
-    model_type="simple",
-    model_class=create_simple_model,
-    is_huggingface=False,
-    input_shape=(4,),
-    debug={
-        'print_activation_replacement_debug': True,
-        'print_network_split_debug': True
-    }
+# Create early stopping callback
+early_stopping = tf.keras.callbacks.EarlyStopping(
+    monitor='val_loss',
+    patience=3,
+    restore_best_weights=True
 )
-modified_model.create_base_model()
+
+# Train original model
+print("Training original model...")
+try:
+    original_history = original_model.model.fit(
+        X_train, y_train,
+        epochs=original_model.config['training']['epochs'],
+        batch_size=original_model.config['training']['batch_size'],
+        validation_split=original_model.config['training']['validation_split'],
+        callbacks=[early_stopping]
+    )
+except KeyboardInterrupt:
+    print("Training interrupted by user. Saving current model weights...")
+    original_model.model.save_weights("original_model_weights.h5")
+
+# Initialize modified model as a deep copy of the trained original model
+print("\nCreating and training modified model...")
+modified_model = original_model.copy()
 
 # Create activation function approximation
 factory = ActivationFunctionFactory(
     base_activation=tf.keras.activations.relu,
-    degree=5,
+    degree=7,
     approximation_type=ApproximationType.CHEBYSHEV
 )
 chebyshev_activation = factory.create()
+
+# Build the copied model by passing a dummy input
+dummy_input = tf.random.normal((1,) + modified_model.input_shape)
+_ = modified_model.model(dummy_input)
 
 # Split activation layers and set activation function
 modified_model.model = modified_model.split_activation_layers()
 modified_model.set_activation_function(chebyshev_activation)
 
-# Train modified model
-modified_model.model.compile(
-    optimizer='adam',
-    loss='categorical_crossentropy',
-    metrics=['accuracy']
-)
-modified_model.model.fit(
-    X_train, y_train,
-    epochs=5,
-    batch_size=32,
-    validation_split=0.1
-)
+# Retrain the modified model
+print("Retraining the modified model using existing retraining strategies...")
+try:
+    modified_history = modified_model.retrain(
+        X_train, 
+        y_train, 
+        RetrainType.ITERATIVE
+    )
+except KeyboardInterrupt:
+    print("Retraining interrupted by user. Saving current model weights...")
+    modified_model.model.save_weights("modified_model_weights.h5")
 
 # Generate analysis report
 generate_analysis_report(
@@ -206,5 +334,7 @@ generate_analysis_report(
     modified_model=modified_model,
     X_train=X_train,
     y_train=y_train,
+    original_history=original_history,
+    modified_history=modified_history,
     output_path="model_analysis_report.pdf"
 )
