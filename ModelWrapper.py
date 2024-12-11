@@ -16,6 +16,10 @@ from transformers import (
 from PIL import Image
 import time
 import copy
+from sklearn.metrics import precision_recall_fscore_support, confusion_matrix, classification_report
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_pdf import PdfPages
+import pandas as pd
 
 from PredictionDecoder import PredictionDecoder
 
@@ -40,13 +44,13 @@ class RetrainType(Enum):
 class ModelWrapper:
     def __init__(
         self, 
-        model_name: str = "microsoft/resnet-50", 
-        model_type: str = "image", 
+        model_name: str = "model", 
+        model_type: str = "classification", 
         debug: Dict[str, bool] = None, 
         model_class: Optional[Any] = None, 
         processor_class: Optional[Any] = None, 
-        is_huggingface: bool = True,
-        input_shape: Tuple[int, ...] = (224, 224, 3),
+        is_huggingface: bool = False,
+        input_shape: Tuple[int, ...] = (28, 28, 1),
         config_path: Optional[str] = None,
         **model_kwargs
     ) -> None:
@@ -115,7 +119,8 @@ class ModelWrapper:
             with open(config_path, 'r') as f:
                 return json.load(f)
         except FileNotFoundError:
-            raise FileNotFoundError(f"Config file not found at {config_path}")
+            print(f"Config file not found at {config_path}, using default settings.")
+            return {}
 
     def set_activation_function(self, activation_function):
         """Set the activation function to use for replacement."""
@@ -124,19 +129,10 @@ class ModelWrapper:
         
     def create_base_model(self) -> 'ModelWrapper':
         """Initialize the model and processor based on model type"""
-        if self.is_huggingface:
-            if self.model_class is not None and self.processor_class is not None:
-                self.model = self.model_class.from_pretrained(self.model_name)
-                self.processor = self.processor_class.from_pretrained(self.model_name)
-            else:
-                raise ValueError("Model class and processor class must be provided for HuggingFace models.")
-        else:
-            # Handle native TensorFlow models
+        if not self.is_huggingface:
             if self.model_class is not None:
                 if callable(self.model_class) and not isinstance(self.model_class, type):
                     # Handle custom model function
-                    print("Creating custom model with input_shape and model_kwargs...")
-                    print(f"model_kwargs: {self.model_kwargs}")  # Debugging
                     self.model = self.model_class(self.input_shape, **self.model_kwargs)
                 else:
                     # Handle built-in Keras models
@@ -148,12 +144,15 @@ class ModelWrapper:
                         )
                     else:
                         self.model = self.model_class()
-                    
+
                 if self.processor_class is not None:
                     self.processor = self.processor_class
             else:
                 raise ValueError("Model class must be provided")
-        
+        else:
+            # Handle HuggingFace models if needed
+            pass
+
         print("Model created successfully.")
         return self
 
@@ -853,3 +852,438 @@ class ModelWrapper:
             raise ValueError("activation_type_to_replace must be set in the config before performing activation replacement operations.")
         if self.activation_function is None:
             raise ValueError("activation_function must be set before performing activation replacement operations.")
+
+    def generate_analysis_report(
+        self,
+        X_test: np.ndarray,
+        y_test: np.ndarray,
+        history: Union[tf.keras.callbacks.History, Dict],
+        report_name: str = "analysis_report.pdf"
+    ) -> None:
+        """
+        Generate a PDF report analyzing the model's performance.
+
+        Args:
+            X_test: Test data.
+            y_test: True labels for the test data.
+            history: Training history.
+            report_name: Filename for the generated report.
+        """
+        with PdfPages(report_name) as pdf:
+            # Page 1: Training Metrics
+            if history is not None:
+                self._plot_training_history(history, pdf)
+
+            # Page 2: Confusion Matrix
+            self._plot_confusion_matrix(X_test, y_test, pdf)
+
+            # Page 3: Classification Report
+            self._plot_classification_report(X_test, y_test, pdf)
+
+            # Additional pages can be added as needed...
+            # For more complex cases, stub methods can be provided for future implementation.
+
+        print(f"Analysis report saved to {report_name}")
+
+    def _plot_training_history(self, history, pdf):
+        """
+        Plot training and validation accuracy and loss over epochs.
+
+        Args:
+            history: Training history.
+            pdf: PdfPages object to save the plot.
+        """
+        fig, axs = plt.subplots(2, 1, figsize=(8, 10))
+
+        # Check if history is a History object or a dictionary
+        if isinstance(history, tf.keras.callbacks.History):
+            hist = history.history
+        elif isinstance(history, dict):
+            hist = history
+        else:
+            print("Unsupported history format.")
+            return
+
+        # Plot accuracy
+        if 'accuracy' in hist:
+            axs[0].plot(hist['accuracy'], label='Training Accuracy')
+            if 'val_accuracy' in hist:
+                axs[0].plot(hist['val_accuracy'], label='Validation Accuracy')
+            axs[0].set_title('Model Accuracy')
+            axs[0].set_xlabel('Epoch')
+            axs[0].set_ylabel('Accuracy')
+            axs[0].legend()
+            axs[0].grid(True)
+        else:
+            axs[0].text(0.5, 0.5, 'Accuracy not available.', horizontalalignment='center', verticalalignment='center')
+
+        # Plot loss
+        if 'loss' in hist:
+            axs[1].plot(hist['loss'], label='Training Loss')
+            if 'val_loss' in hist:
+                axs[1].plot(hist['val_loss'], label='Validation Loss')
+            axs[1].set_title('Model Loss')
+            axs[1].set_xlabel('Epoch')
+            axs[1].set_ylabel('Loss')
+            axs[1].legend()
+            axs[1].grid(True)
+        else:
+            axs[1].text(0.5, 0.5, 'Loss not available.', horizontalalignment='center', verticalalignment='center')
+
+        plt.tight_layout()
+        pdf.savefig()
+        plt.close()
+
+    def _plot_confusion_matrix(self, X_test, y_test, pdf):
+        """
+        Plot the confusion matrix.
+
+        Args:
+            X_test: Test data.
+            y_test: True labels.
+            pdf: PdfPages object to save the plot.
+        """
+        y_pred = self.model.predict(X_test)
+        y_pred_classes = np.argmax(y_pred, axis=1)
+        y_true = np.argmax(y_test, axis=1)
+
+        cm = confusion_matrix(y_true, y_pred_classes)
+        fig, ax = plt.subplots(figsize=(8, 6))
+        cax = ax.matshow(cm, cmap=plt.cm.Blues)
+        fig.colorbar(cax)
+
+        ax.set_xlabel('Predicted')
+        ax.set_ylabel('True')
+        ax.set_title('Confusion Matrix')
+
+        # Set tick marks
+        classes = np.unique(y_true)
+        ax.set_xticks(range(len(classes)))
+        ax.set_yticks(range(len(classes)))
+        ax.set_xticklabels(classes)
+        ax.set_yticklabels(classes)
+
+        # Annotate each cell
+        for (i, j), z in np.ndenumerate(cm):
+            ax.text(j, i, '{}'.format(z), ha='center', va='center')
+
+        plt.tight_layout()
+        pdf.savefig()
+        plt.close()
+
+    def _plot_classification_report(self, X_test, y_test, pdf):
+        """
+        Generate and plot the classification report.
+
+        Args:
+            X_test: Test data.
+            y_test: True labels.
+            pdf: PdfPages object to save the plot.
+        """
+        y_pred = self.model.predict(X_test)
+        y_pred_classes = np.argmax(y_pred, axis=1)
+        y_true = np.argmax(y_test, axis=1)
+
+        report = classification_report(y_true, y_pred_classes, output_dict=True)
+        report_df = pd.DataFrame(report).transpose()
+
+        fig, ax = plt.subplots(figsize=(8.5, len(report_df) * 0.5))
+        ax.axis('tight')
+        ax.axis('off')
+        table = ax.table(cellText=np.round(report_df.values, 2),
+                         rowLabels=report_df.index,
+                         colLabels=report_df.columns,
+                         cellLoc='center',
+                         loc='center')
+        table.scale(1, 1.5)
+        ax.set_title('Classification Report')
+
+        plt.tight_layout()
+        pdf.savefig()
+        plt.close()
+
+    def generate_comparison_report(
+        original_model: 'ModelWrapper',
+        modified_model: 'ModelWrapper',
+        X_test: np.ndarray,
+        y_test: np.ndarray,
+        original_history: Union[tf.keras.callbacks.History, Dict],
+        modified_history: Union[tf.keras.callbacks.History, Dict],
+        report_name: str = "comparison_report.pdf"
+    ) -> None:
+        """
+        Generate a PDF report comparing the original and modified models.
+
+        Args:
+            original_model: The original ModelWrapper instance.
+            modified_model: The modified ModelWrapper instance.
+            X_test: Test data.
+            y_test: True labels for the test data.
+            original_history: Training history of the original model.
+            modified_history: Training history of the modified model.
+            report_name: Filename for the generated report.
+        """
+        with PdfPages(report_name) as pdf:
+            # Page 1: Training Metrics Comparison
+            ModelWrapper._plot_training_histories(
+                original_history, modified_history, pdf
+            )
+
+            # Page 2: Confusion Matrices
+            ModelWrapper._plot_confusion_matrices(
+                original_model, modified_model, X_test, y_test, pdf
+            )
+
+            # Page 3: Classification Reports
+            ModelWrapper._plot_classification_reports(
+                original_model, modified_model, X_test, y_test, pdf
+            )
+
+            # Page 4: Prediction Distributions
+            ModelWrapper._plot_prediction_distributions(
+                original_model, modified_model, X_test, pdf
+            )
+
+            # Page 5: Difference in Predictions
+            ModelWrapper._plot_prediction_differences(
+                original_model, modified_model, X_test, pdf
+            )
+
+            # Additional pages can be added as needed...
+
+        print(f"Comparison report saved to {report_name}")
+
+    @staticmethod
+    def _plot_training_histories(
+        original_history, modified_history, pdf
+    ):
+        """
+        Plot training and validation accuracy and loss over epochs for both models.
+
+        Args:
+            original_history: Training history of the original model.
+            modified_history: Training history of the modified model.
+            pdf: PdfPages object to save the plot.
+        """
+        fig, axs = plt.subplots(2, 2, figsize=(12, 10))
+
+        # Extract histories
+        orig_hist = (
+            original_history.history if isinstance(original_history, tf.keras.callbacks.History) 
+            else original_history
+        )
+        mod_hist = (
+            modified_history.history if isinstance(modified_history, tf.keras.callbacks.History) 
+            else modified_history
+        )
+
+        # Plot loss
+        axs[0, 0].plot(orig_hist.get('loss', []), label='Training Loss')
+        axs[0, 0].plot(orig_hist.get('val_loss', []), label='Validation Loss')
+        axs[0, 0].set_title('Original Model Loss')
+        axs[0, 0].set_xlabel('Epoch')
+        axs[0, 0].set_ylabel('Loss')
+        axs[0, 0].legend()
+        axs[0, 0].grid(True)
+
+        axs[0, 1].plot(mod_hist.get('loss', []), label='Training Loss')
+        axs[0, 1].plot(mod_hist.get('val_loss', []), label='Validation Loss')
+        axs[0, 1].set_title('Modified Model Loss')
+        axs[0, 1].set_xlabel('Epoch')
+        axs[0, 1].set_ylabel('Loss')
+        axs[0, 1].legend()
+        axs[0, 1].grid(True)
+
+        # Plot accuracy
+        axs[1, 0].plot(orig_hist.get('accuracy', []), label='Training Accuracy')
+        axs[1, 0].plot(orig_hist.get('val_accuracy', []), label='Validation Accuracy')
+        axs[1, 0].set_title('Original Model Accuracy')
+        axs[1, 0].set_xlabel('Epoch')
+        axs[1, 0].set_ylabel('Accuracy')
+        axs[1, 0].legend()
+        axs[1, 0].grid(True)
+
+        axs[1, 1].plot(mod_hist.get('accuracy', []), label='Training Accuracy')
+        axs[1, 1].plot(mod_hist.get('val_accuracy', []), label='Validation Accuracy')
+        axs[1, 1].set_title('Modified Model Accuracy')
+        axs[1, 1].set_xlabel('Epoch')
+        axs[1, 1].set_ylabel('Accuracy')
+        axs[1, 1].legend()
+        axs[1, 1].grid(True)
+
+        plt.tight_layout()
+        pdf.savefig()
+        plt.close()
+
+    @staticmethod
+    def _plot_confusion_matrices(
+        original_model, modified_model, X_test, y_test, pdf
+    ):
+        """
+        Plot the confusion matrices for both models.
+
+        Args:
+            original_model: The original ModelWrapper instance.
+            modified_model: The modified ModelWrapper instance.
+            X_test: Test data.
+            y_test: True labels.
+            pdf: PdfPages object to save the plot.
+        """
+        y_pred_orig = original_model.model.predict(X_test)
+        y_pred_mod = modified_model.model.predict(X_test)
+        y_pred_classes_orig = np.argmax(y_pred_orig, axis=1)
+        y_pred_classes_mod = np.argmax(y_pred_mod, axis=1)
+        y_true = np.argmax(y_test, axis=1)
+
+        fig, axs = plt.subplots(1, 2, figsize=(12, 6))
+
+        # Original Model Confusion Matrix
+        cm_orig = confusion_matrix(y_true, y_pred_classes_orig)
+        axs[0].matshow(cm_orig, cmap=plt.cm.Blues)
+        axs[0].set_title('Original Model Confusion Matrix')
+        axs[0].set_xlabel('Predicted')
+        axs[0].set_ylabel('True')
+
+        # Modified Model Confusion Matrix
+        cm_mod = confusion_matrix(y_true, y_pred_classes_mod)
+        axs[1].matshow(cm_mod, cmap=plt.cm.Blues)
+        axs[1].set_title('Modified Model Confusion Matrix')
+        axs[1].set_xlabel('Predicted')
+        axs[1].set_ylabel('True')
+
+        plt.tight_layout()
+        pdf.savefig()
+        plt.close()
+
+    @staticmethod
+    def _plot_classification_reports(
+        original_model, modified_model, X_test, y_test, pdf
+    ):
+        """
+        Generate and plot the classification reports for both models.
+
+        Args:
+            original_model: The original ModelWrapper instance.
+            modified_model: The modified ModelWrapper instance.
+            X_test: Test data.
+            y_test: True labels.
+            pdf: PdfPages object to save the plot.
+        """
+        y_pred_orig = original_model.model.predict(X_test)
+        y_pred_mod = modified_model.model.predict(X_test)
+        y_pred_classes_orig = np.argmax(y_pred_orig, axis=1)
+        y_pred_classes_mod = np.argmax(y_pred_mod, axis=1)
+        y_true = np.argmax(y_test, axis=1)
+
+        report_orig = classification_report(y_true, y_pred_classes_orig, output_dict=True)
+        report_mod = classification_report(y_true, y_pred_classes_mod, output_dict=True)
+
+        report_df_orig = pd.DataFrame(report_orig).transpose()
+        report_df_mod = pd.DataFrame(report_mod).transpose()
+
+        fig, axs = plt.subplots(1, 2, figsize=(17, len(report_df_orig) * 0.5))
+        
+        # Original Model Classification Report
+        axs[0].axis('tight')
+        axs[0].axis('off')
+        table_orig = axs[0].table(
+            cellText=np.round(report_df_orig.values, 2),
+            rowLabels=report_df_orig.index,
+            colLabels=report_df_orig.columns,
+            cellLoc='center',
+            loc='center'
+        )
+        table_orig.scale(1, 1.5)
+        axs[0].set_title('Original Model Classification Report')
+
+        # Modified Model Classification Report
+        axs[1].axis('tight')
+        axs[1].axis('off')
+        table_mod = axs[1].table(
+            cellText=np.round(report_df_mod.values, 2),
+            rowLabels=report_df_mod.index,
+            colLabels=report_df_mod.columns,
+            cellLoc='center',
+            loc='center'
+        )
+        table_mod.scale(1, 1.5)
+        axs[1].set_title('Modified Model Classification Report')
+
+        plt.tight_layout()
+        pdf.savefig()
+        plt.close()
+
+    @staticmethod
+    def _plot_prediction_distributions(
+        original_model, modified_model, X_test, pdf
+    ):
+        """
+        Plot the distributions of the model outputs (probabilities or logits) for both models.
+
+        Args:
+            original_model: The original ModelWrapper instance.
+            modified_model: The modified ModelWrapper instance.
+            X_test: Test data.
+            pdf: PdfPages object to save the plot.
+        """
+        y_pred_orig = original_model.model.predict(X_test)
+        y_pred_mod = modified_model.model.predict(X_test)
+
+        # Flatten the predictions to 1D arrays
+        y_pred_orig_flat = y_pred_orig.flatten()
+        y_pred_mod_flat = y_pred_mod.flatten()
+
+        plt.figure(figsize=(12, 6))
+        plt.hist(y_pred_orig_flat, bins=50, alpha=0.5, label='Original Model')
+        plt.hist(y_pred_mod_flat, bins=50, alpha=0.5, label='Modified Model')
+        plt.title('Prediction Distributions')
+        plt.xlabel('Predicted Value')
+        plt.ylabel('Frequency')
+        plt.legend()
+        plt.grid(True)
+
+        plt.tight_layout()
+        pdf.savefig()
+        plt.close()
+
+    @staticmethod
+    def _plot_prediction_differences(
+        original_model, modified_model, X_test, pdf
+    ):
+        """
+        Plot the differences between the predictions of the original and modified models.
+
+        Args:
+            original_model: The original ModelWrapper instance.
+            modified_model: The modified ModelWrapper instance.
+            X_test: Test data.
+            pdf: PdfPages object to save the plot.
+        """
+        y_pred_orig = original_model.model.predict(X_test)
+        y_pred_mod = modified_model.model.predict(X_test)
+        differences = y_pred_orig - y_pred_mod
+
+        # Plot histogram of differences
+        plt.figure(figsize=(12, 6))
+        plt.hist(differences.flatten(), bins=50, alpha=0.7)
+        plt.title('Differences in Predictions (Original - Modified)')
+        plt.xlabel('Difference')
+        plt.ylabel('Frequency')
+        plt.grid(True)
+
+        plt.tight_layout()
+        pdf.savefig()
+        plt.close()
+
+        # Scatter plot of predictions
+        plt.figure(figsize=(12, 6))
+        plt.scatter(y_pred_orig.flatten(), y_pred_mod.flatten(), alpha=0.5)
+        plt.plot([y_pred_orig.min(), y_pred_orig.max()], [y_pred_orig.min(), y_pred_orig.max()], 'r--')
+        plt.title('Original vs. Modified Predictions')
+        plt.xlabel('Original Predictions')
+        plt.ylabel('Modified Predictions')
+        plt.grid(True)
+
+        plt.tight_layout()
+        pdf.savefig()
+        plt.close()
