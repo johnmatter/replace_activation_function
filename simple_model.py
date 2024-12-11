@@ -2,6 +2,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import tensorflow as tf
 from tensorflow.keras import regularizers
+from sklearn.metrics import precision_recall_fscore_support
 
 from ActivationFunction import ActivationFunctionFactory, ApproximationType
 from ModelWrapper import ModelWrapper
@@ -45,17 +46,28 @@ def generate_analysis_report(
         plt.close()
 
         # Page 2: Training Metrics - Original Model
-        plt.figure(figsize=(12, 6))
-        epochs = original_history.epoch
-        plt.plot(epochs, original_history.history['loss'], label='Training Loss')
-        plt.plot(epochs, original_history.history['val_loss'], label='Validation Loss')
-        plt.plot(epochs, original_history.history['accuracy'], label='Training Accuracy')
-        plt.plot(epochs, original_history.history['val_accuracy'], label='Validation Accuracy')
-        plt.title('Original Model Training Metrics')
-        plt.xlabel('Epoch')
-        plt.ylabel('Metric')
-        plt.legend()
-        plt.grid(True)
+        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 12))
+        epochs = range(1, len(original_history.history['loss']) + 1)
+        
+        # Loss subplot
+        ax1.plot(epochs, original_history.history['loss'], 'b-', label='Training Loss')
+        ax1.plot(epochs, original_history.history['val_loss'], 'r-', label='Validation Loss')
+        ax1.set_title('Original Model Training and Validation Loss')
+        ax1.set_xlabel('Epoch')
+        ax1.set_ylabel('Loss')
+        ax1.legend()
+        ax1.grid(True)
+        
+        # Accuracy subplot
+        ax2.plot(epochs, original_history.history['accuracy'], 'b-', label='Training Accuracy')
+        ax2.plot(epochs, original_history.history['val_accuracy'], 'r-', label='Validation Accuracy')
+        ax2.set_title('Original Model Training and Validation Accuracy')
+        ax2.set_xlabel('Epoch')
+        ax2.set_ylabel('Accuracy')
+        ax2.legend()
+        ax2.grid(True)
+        
+        plt.tight_layout()
         pdf.savefig()
         plt.close()
 
@@ -82,24 +94,64 @@ def generate_analysis_report(
                     plt.close()
 
         elif retrain_type == 'iterative':
-            # Handle 'iterative' retraining strategy
+            # First, find the min/max values across all layers for consistent scaling
+            loss_min, loss_max = float('inf'), float('-inf')
+            acc_min, acc_max = float('inf'), float('-inf')
+            
             for entry in modified_history['iterative']:
                 hist = entry['history']
+                loss_min = min(loss_min, min(hist['loss']), min(hist['val_loss']))
+                loss_max = max(loss_max, max(hist['loss']), max(hist['val_loss']))
+                acc_min = min(acc_min, min(hist['accuracy']), min(hist['val_accuracy']))
+                acc_max = max(acc_max, max(hist['accuracy']), max(hist['val_accuracy']))
+            
+            # Add some padding to the ranges
+            loss_range = loss_max - loss_min
+            acc_range = acc_max - acc_min
+            loss_min -= loss_range * 0.1
+            loss_max += loss_range * 0.1
+            acc_min = max(0, acc_min - acc_range * 0.1)  # Don't go below 0 for accuracy
+            acc_max = min(1, acc_max + acc_range * 0.1)  # Don't exceed 1 for accuracy
+            
+            # Create a figure with subplots for all layers
+            n_layers = len(modified_history['iterative'])
+            fig, axes = plt.subplots(2, n_layers, figsize=(6*n_layers, 12))
+            
+            # If there's only one layer, axes needs to be 2D
+            if n_layers == 1:
+                axes = axes.reshape(-1, 1)
+            
+            for idx, entry in enumerate(modified_history['iterative']):
+                hist = entry['history']
                 layer_idx = entry['layer']
-                phase = entry['phase']
-                plt.figure(figsize=(12, 6))
                 epochs = range(1, len(hist['loss']) + 1)
-                plt.plot(epochs, hist['loss'], label='Training Loss')
-                plt.plot(epochs, hist['val_loss'], label='Validation Loss')
-                plt.plot(epochs, hist['accuracy'], label='Training Accuracy')
-                plt.plot(epochs, hist['val_accuracy'], label='Validation Accuracy')
-                plt.title(f'Iterative Retraining (Layer {layer_idx + 1}, {phase.replace("_", " ").title()})')
-                plt.xlabel('Epoch')
-                plt.ylabel('Metric')
-                plt.legend()
-                plt.grid(True)
-                pdf.savefig()
-                plt.close()
+                
+                # Loss subplot
+                ax_loss = axes[0, idx]
+                ax_loss.plot(epochs, hist['loss'], 'b-', label='Training Loss')
+                ax_loss.plot(epochs, hist['val_loss'], 'r-', label='Validation Loss')
+                ax_loss.set_title(f'Layer {layer_idx + 1} Loss')
+                ax_loss.set_xlabel('Epoch')
+                ax_loss.set_ylabel('Loss')
+                ax_loss.set_ylim(loss_min, loss_max)
+                ax_loss.legend()
+                ax_loss.grid(True)
+                
+                # Accuracy subplot
+                ax_acc = axes[1, idx]
+                ax_acc.plot(epochs, hist['accuracy'], 'b-', label='Training Accuracy')
+                ax_acc.plot(epochs, hist['val_accuracy'], 'r-', label='Validation Accuracy')
+                ax_acc.set_title(f'Layer {layer_idx + 1} Accuracy')
+                ax_acc.set_xlabel('Epoch')
+                ax_acc.set_ylabel('Accuracy')
+                ax_acc.set_ylim(acc_min, acc_max)
+                ax_acc.legend()
+                ax_acc.grid(True)
+            
+            plt.suptitle('Modified Model Training Metrics by Layer', fontsize=16, y=1.02)
+            plt.tight_layout()
+            pdf.savefig(bbox_inches='tight')
+            plt.close()
 
         elif retrain_type == 'batched':
             # Handle 'batched' retraining strategy
@@ -193,6 +245,48 @@ def generate_analysis_report(
         pdf.savefig()
         plt.close()
 
+        # Calculate predictions for metrics
+        original_preds = original_model.model.predict(X_train)
+        modified_preds = modified_model.model.predict(X_train)
+        
+        # Calculate metrics
+        orig_precision, orig_recall, orig_f1, _ = precision_recall_fscore_support(
+            y_train.argmax(axis=1),
+            original_preds.argmax(axis=1),
+            average='binary'
+        )
+        
+        mod_precision, mod_recall, mod_f1, _ = precision_recall_fscore_support(
+            y_train.argmax(axis=1),
+            modified_preds.argmax(axis=1),
+            average='binary'
+        )
+
+        # Plot comparison metrics
+        fig, axes = plt.subplots(2, 2, figsize=(15, 15))
+        metrics = {
+            'Precision': (orig_precision, mod_precision),
+            'Recall': (orig_recall, mod_recall),
+            'F1 Score': (orig_f1, mod_f1),
+            'Accuracy': (
+                np.mean(y_train.argmax(axis=1) == original_preds.argmax(axis=1)),
+                np.mean(y_train.argmax(axis=1) == modified_preds.argmax(axis=1))
+            )
+        }
+
+        for (metric_name, (orig_val, mod_val)), ax in zip(metrics.items(), axes.flatten()):
+            x = ['Original Model', 'Modified Model']
+            y = [orig_val, mod_val]
+            ax.bar(x, y)
+            ax.set_title(f'{metric_name} Comparison')
+            ax.set_ylim(0, 1)
+            for i, v in enumerate(y):
+                ax.text(i, v + 0.01, f'{v:.3f}', ha='center')
+
+        plt.tight_layout()
+        pdf.savefig()
+        plt.close()
+
     print(f"Analysis report saved to {output_path}")
 
 def create_simple_model(input_shape, regularizer=None):
@@ -231,7 +325,7 @@ def create_simple_model(input_shape, regularizer=None):
 
 # Generate synthetic data with two Gaussian clusters per class
 np.random.seed(42)
-n_samples = 100000
+n_samples = 10000
 n_features = 4
 
 # Class 0: Two Gaussian clusters
