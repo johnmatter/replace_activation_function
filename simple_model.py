@@ -2,7 +2,6 @@ import matplotlib.pyplot as plt
 import numpy as np
 import tensorflow as tf
 from tensorflow.keras import regularizers
-from sklearn.metrics import precision_recall_fscore_support
 
 from ActivationFunction import ActivationFunctionFactory, ApproximationType
 from ModelWrapper import ModelWrapper
