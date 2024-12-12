@@ -74,12 +74,23 @@ class ModelWrapper:
         self.activation_layer_pairs = []  # List of (original_layer, activation_layer) tuples
         self.model_kwargs = model_kwargs  # Store additional kwargs
 
-        # Initialize compilation settings
-        self.base_settings = {
-            'loss': tf.keras.losses.CategoricalCrossentropy(from_logits=False),
-            'metrics': [tf.keras.metrics.CategoricalAccuracy(name='accuracy')],
-            'jit_compile': False
-        }
+        # Initialize compilation settings based on model type
+        if model_type == "classification":
+            self.base_settings = {
+                'loss': tf.keras.losses.CategoricalCrossentropy(from_logits=False),
+                'metrics': [
+                    tf.keras.metrics.CategoricalAccuracy(name='accuracy'),
+                    tf.keras.metrics.TopKCategoricalAccuracy(k=5, name='top_5_accuracy')
+                ],
+                'jit_compile': False
+            }
+        else:
+            # Default settings for other model types
+            self.base_settings = {
+                'loss': 'mse',
+                'metrics': ['mae'],
+                'jit_compile': False
+            }
         
         # Initialize optimizer settings
         self.current_compile_settings = None
@@ -94,6 +105,18 @@ class ModelWrapper:
 
         if self.activation_function_to_replace is None:
             raise ValueError("activation_type_to_replace must be specified in the config.")
+
+        # Initialize callbacks as an empty list
+        self.callbacks: List[tf.keras.callbacks.Callback] = []
+
+        # If you have callbacks defined in the config, initialize them here
+        if config_path:
+            # Example: Load callbacks from a config file
+            config = self.load_config(config_path)
+            self.callbacks = self.initialize_callbacks(config.get('callbacks', []))
+        
+        # Initialize other attributes as needed
+        self.activation_layer_pairs: List[Tuple[tf.keras.layers.Layer, tf.keras.layers.Activation]] = []
 
     def save(self, model_path: str) -> None:
         """Save the model"""
@@ -167,18 +190,13 @@ class ModelWrapper:
         # Reset activation_layer_pairs
         self.activation_layer_pairs = []
 
-        # Check if the model is Sequential or Functional
         if isinstance(self.model, tf.keras.Sequential):
-            if self.debug.get('print_network_split_debug', False):
-                print("Model is Sequential.")
-
-            # Create a new list of layers
             new_layers = []
-
-            for layer in self.model.layers:
-                # Get layer config
+            
+            for i, layer in enumerate(self.model.layers):
                 config = layer.get_config()
-
+                is_final_layer = i == len(self.model.layers) - 1
+                
                 # Check if the layer has 'activation' in its config
                 has_activation_in_config = (
                     'activation' in config and
@@ -186,7 +204,11 @@ class ModelWrapper:
                     config['activation'] != 'linear'
                 )
 
-                if has_activation_in_config and config['activation'] == self.config['activation_type_to_replace']:
+                # Only replace non-softmax activations and non-final layers
+                if (has_activation_in_config and 
+                    config['activation'] == self.config['activation_type_to_replace'] and
+                    not (is_final_layer and config['activation'] == 'softmax')):
+                    
                     # Remove activation from config
                     original_activation = config['activation']
                     config['activation'] = 'linear'
@@ -197,20 +219,10 @@ class ModelWrapper:
                     # Clone layer without activation
                     new_layer = layer.__class__.from_config(config)
 
-                    # Build and set weights only if the layer has weights
+                    # Build and set weights if the layer has weights
                     if layer.get_weights() and hasattr(layer, 'input_shape'):
                         new_layer.build(layer.input_shape)
                         new_layer.set_weights(layer.get_weights())
-                    # Another approach might be:
-                    # weight_layers = (
-                        # tf.keras.layers.Dense,
-                        # tf.keras.layers.Conv2D,
-                        # tf.keras.layers.BatchNormalization,
-                        # Add other layer types as needed
-                    # )
-                    # if isinstance(layer, weight_layers):
-                        # new_layer.build(layer.input_shape)
-                        # new_layer.set_weights(layer.get_weights())
 
                     # Append the new layer
                     new_layers.append(new_layer)
@@ -230,27 +242,39 @@ class ModelWrapper:
 
             # Create a new Sequential model
             new_model = tf.keras.Sequential(new_layers, name=self.model.name)
-
-            # Update the model reference
-            self.model = new_model
+            
+            # Recompile if original was compiled
+            if hasattr(self.model, 'optimizer') and self.model.optimizer is not None:
+                self.model = new_model
+                self.compile_model()
+            else:
+                self.model = new_model
+            
+            return self.model
 
         else:
-            if self.debug.get('print_network_split_debug', False):
-                print("Model is Functional.")
-
-            # Define the clone function
-            def clone_function(layer):
-                # Get layer config
+            # Handle Functional API models
+            inputs = self.model.input
+            layer_outputs = {}
+            new_layers = {}
+            
+            # First pass: create new layers without activation
+            for layer in self.model.layers:
                 config = layer.get_config()
-
-                # Check if the layer has an 'activation' in its config
+                is_output_layer = layer.name == self.model.output.name.split('/')[0]
+                
+                # Check if the layer has 'activation' in its config
                 has_activation_in_config = (
                     'activation' in config and
                     config['activation'] is not None and
                     config['activation'] != 'linear'
                 )
 
-                if has_activation_in_config and config['activation'] == self.config['activation_type_to_replace']:
+                # Only replace non-softmax activations and non-output layers
+                if (has_activation_in_config and 
+                    config['activation'] == self.config['activation_type_to_replace'] and
+                    not (is_output_layer and config['activation'] == 'softmax')):
+                    
                     # Remove activation from config
                     original_activation = config['activation']
                     config['activation'] = 'linear'
@@ -258,43 +282,63 @@ class ModelWrapper:
                     if self.debug.get('print_activation_replacement_debug', False):
                         print(f"Splitting activation in layer {layer.name}")
 
-                    # Clone the layer without activation
+                    # Clone layer without activation
                     new_layer = layer.__class__.from_config(config)
+                    
+                    # Create new activation layer
+                    activation_layer = tf.keras.layers.Activation(
+                        activation=original_activation,
+                        name=f"{layer.name}_activation"
+                    )
+                    
+                    # Store both layers
+                    new_layers[layer.name] = (new_layer, activation_layer)
+                    
+                    # Save the pair for replacement during retraining
+                    self.activation_layer_pairs.append((new_layer, activation_layer))
+                else:
+                    # Keep layer as-is
+                    new_layers[layer.name] = (layer, None)
 
-                    # Return a function that applies the layer and then adds the new activation layer
-                    def apply_new_layer(inputs):
-                        x = new_layer(inputs)
-                        activation_layer = tf.keras.layers.Activation(
-                            activation=original_activation,
-                            name=f"{layer.name}_activation"
-                        )
-                        x = activation_layer(x)
-                        # Save the pair for replacement during retraining
-                        self.activation_layer_pairs.append((new_layer, activation_layer))
-                        return x
+            # Second pass: reconstruct model connections
+            for layer in self.model.layers:
+                current_layer, activation_layer = new_layers[layer.name]
+                
+                # Get input tensors for current layer
+                if layer.name == self.model.layers[0].name:
+                    # Input layer
+                    layer_outputs[layer.name] = current_layer(inputs)
+                else:
+                    # Get inbound nodes
+                    inbound_layers = layer._inbound_nodes[0].inbound_layers
+                    if not isinstance(inbound_layers, list):
+                        inbound_layers = [inbound_layers]
+                    
+                    # Get input tensors
+                    input_tensors = [layer_outputs[l.name] for l in inbound_layers]
+                    if len(input_tensors) == 1:
+                        input_tensors = input_tensors[0]
+                    
+                    # Apply current layer
+                    layer_outputs[layer.name] = current_layer(input_tensors)
+                
+                # Apply activation layer if it exists
+                if activation_layer is not None:
+                    layer_outputs[layer.name] = activation_layer(layer_outputs[layer.name])
 
-                    return apply_new_layer
+            # Create new model
+            outputs = layer_outputs[self.model.layers[-1].name]
+            new_model = tf.keras.Model(inputs=inputs, outputs=outputs, name=self.model.name)
+            
+            # Recompile if original was compiled
+            if hasattr(self.model, 'optimizer'):
+                self.model = new_model
+                self.compile_model()
+            else:
+                self.model = new_model
 
-                # Return the layer as-is
-                return layer
+            return self.model
 
-            # Clone the model using the custom clone_function
-            new_model = tf.keras.models.clone_model(
-                self.model,
-                clone_function=clone_function
-            )
-
-            # Copy weights from the original model to the new model
-            new_model.set_weights(self.model.get_weights())
-
-            # Update the model reference
-            self.model = new_model
-
-        if self.debug.get('print_network_split_debug', False):
-            print("Finished split_activation_layers")
-
-        return self.model
-        
     def replace_all_activations(self, original_activation_function: Callable, replacement_activation_function: Callable) -> 'ModelWrapper':
         replacements_made = 0
         skipped_replacements = 0
@@ -418,99 +462,128 @@ class ModelWrapper:
     def retrain(self, train_data: np.ndarray, train_labels: np.ndarray) -> dict:
         """
         Retrain the model using the specified strategy from config.
-
+        
         Args:
             train_data: Training data.
             train_labels: Training labels.
-
+        
         Returns:
             A dictionary containing training histories.
         """
-        from tensorflow.keras.callbacks import History
-
+        from tensorflow.keras.callbacks import History, EarlyStopping
+        
         # Validate activation function settings
         self._validate_activation_replacement()
-
+        
         # Retrieve retraining configuration
         retraining_config = self.config.get('retraining', {})
         retraining_type = retraining_config.get('retraining_type')
-
+        
         if retraining_type not in ['all', 'iterative', 'batched']:
             raise ValueError(f"Unsupported retraining_type: {retraining_type}")
-
+        
         batch_size = retraining_config.get('batch_size', 32)
         activation_replacement_batch_size = retraining_config.get('activation_replacement_batch_size', 1)
         epochs = retraining_config.get('epochs', 5)
-
+        
         # Prepare datasets
         validation_split = self.config['training'].get('validation_split', 0.1)
         split_index = int(len(train_data) * (1 - validation_split))
         x_train, x_val = train_data[:split_index], train_data[split_index:]
         y_train, y_val = train_labels[:split_index], train_labels[split_index:]
-
+        
+        # Create early stopping callback
+        early_stopping = EarlyStopping(
+            monitor='val_loss',
+            patience=3,
+            restore_best_weights=True,
+            min_delta=0.001
+        )
+        
+        # Determine number of classes from labels shape
+        num_classes = y_train.shape[-1] if len(y_train.shape) > 1 else len(np.unique(y_train))
+        
+        # Update compilation settings based on number of classes
+        if num_classes > 2:
+            self.base_settings.update({
+                'loss': 'categorical_crossentropy',
+                'metrics': ['accuracy', 'categorical_accuracy']
+            })
+        else:
+            self.base_settings.update({
+                'loss': 'binary_crossentropy',
+                'metrics': ['accuracy', 'binary_accuracy']
+            })
+        
         train_dataset = tf.data.Dataset.from_tensor_slices((x_train, y_train)).batch(batch_size)
         val_dataset = tf.data.Dataset.from_tensor_slices((x_val, y_val)).batch(batch_size)
-
+        
         history = {}
-
+        
         if retraining_type == 'all':
-            history = self._retrain_all(train_dataset, val_dataset, epochs)
+            history = self._retrain_all(train_dataset, val_dataset, epochs, callbacks=[early_stopping])
         elif retraining_type == 'iterative':
-            history = self._retrain_iterative(train_dataset, val_dataset, epochs)
+            history = self._retrain_iterative(train_dataset, val_dataset, epochs, callbacks=[early_stopping])
         elif retraining_type == 'batched':
-            history = self._retrain_batched(train_dataset, val_dataset, activation_replacement_batch_size, epochs)
-
+            history = self._retrain_batched(train_dataset, val_dataset, activation_replacement_batch_size, epochs, callbacks=[early_stopping])
+        
         return history
 
-    def _retrain_all(self, train_dataset, val_dataset, epochs):
+    def _retrain_all(self, train_dataset, val_dataset, epochs, callbacks=None):
         """Retrain all layers at once."""
         history = {}
-        # Assuming 'all_mode' parameters are now part of the unified config
-        # Retrieve any specific settings if needed
         config = self.config['retraining']
+        
+        callbacks = callbacks or []
         
         # Optional: Train before activation replacement
         if config.get('train_before_activation', False):
             print("Training before activation replacement...")
             self.model.compile(
                 optimizer=self.get_optimizer(),
-                loss=self.config['training']['loss'],
-                metrics=self.config['training']['metrics']
+                loss=self.base_settings['loss'],
+                metrics=self.base_settings['metrics']
             )
             hist_before = self.model.fit(
                 train_dataset,
                 epochs=epochs,
-                validation_data=val_dataset
+                validation_data=val_dataset,
+                callbacks=callbacks
             )
             history['train_before_activation'] = hist_before.history
-
+        
         # Replace all specified activations
         print("Replacing all specified activation functions...")
         for activation_layer in self.get_activation_layers():
             self.replace_activation(activation_layer, self.activation_function)
-
+        
         # Optional: Train after activation replacement
         if config.get('train_after_activation', False):
             print("Training after activation replacement...")
-            self.reset_optimizer(learning_rate_scale=0.1)  # Assuming this method resets the optimizer appropriately
+            self.reset_optimizer(learning_rate_scale=0.1)
             self.model.compile(
                 optimizer=self.get_optimizer(),
-                loss=self.config['training']['loss'],
-                metrics=self.config['training']['metrics']
+                loss=self.base_settings['loss'],
+                metrics=self.base_settings['metrics']
             )
             hist_after = self.model.fit(
                 train_dataset,
                 epochs=epochs,
-                validation_data=val_dataset
+                validation_data=val_dataset,
+                callbacks=callbacks
             )
             history['train_after_activation'] = hist_after.history
-
+        
         return history
 
-    def _retrain_iterative(self, train_dataset, val_dataset, epochs):
+    def _retrain_iterative(self, train_dataset, val_dataset, epochs, callbacks=None):
         """Iteratively retrain layers."""
         history = {'iterative': []}
         activation_layers = self.get_activation_layers()
+        callbacks = callbacks or []
+
+        # Save initial weights
+        initial_weights = [layer.get_weights() for layer in self.model.layers]
 
         for idx, activation_layer in enumerate(activation_layers):
             if self.debug.get('print_retrain_debug', False):
@@ -527,13 +600,16 @@ class ModelWrapper:
             prev_layer = self.get_trainable_layer_before(activation_layer)
             next_layer = self.get_trainable_layer_after(activation_layer)
 
+            trainable_layers = []
             if prev_layer:
                 prev_layer.trainable = True
+                trainable_layers.append(prev_layer.name)
                 if self.debug.get('print_retrain_debug', False):
                     print(f"Training layer before activation: {prev_layer.name}")
 
             if next_layer:
                 next_layer.trainable = True
+                trainable_layers.append(next_layer.name)
                 if self.debug.get('print_retrain_debug', False):
                     print(f"Training layer after activation: {next_layer.name}")
 
@@ -543,8 +619,8 @@ class ModelWrapper:
             # Compile the model
             self.model.compile(
                 optimizer=optimizer,
-                loss=self.config['training']['loss'],
-                metrics=self.config['training']['metrics']
+                loss=self.base_settings['loss'],
+                metrics=self.base_settings['metrics']
             )
 
             # Train the model
@@ -552,24 +628,41 @@ class ModelWrapper:
             hist = self.model.fit(
                 train_dataset,
                 epochs=epochs,
-                validation_data=val_dataset
+                validation_data=val_dataset,
+                callbacks=callbacks
             )
+
+            # Check if training improved the model
+            val_loss = hist.history['val_loss'][-1]
+            if val_loss > hist.history['val_loss'][0] * 1.1:  # 10% worse
+                print("Training degraded model performance. Reverting weights...")
+                # Revert weights for trainable layers
+                for layer, weights in zip(self.model.layers, initial_weights):
+                    if layer.name in trainable_layers:
+                        layer.set_weights(weights)
 
             # Record history
             history_entry = {
                 'layer': idx,
+                'layer_name': activation_layer.name,
+                'trainable_layers': trainable_layers,
                 'phase': 'post_activation_replacement',
-                'history': hist.history
+                'history': hist.history,
+                'reverted': val_loss > hist.history['val_loss'][0] * 1.1
             }
             history['iterative'].append(history_entry)
 
         return history
 
-    def _retrain_batched(self, train_dataset, val_dataset, activation_replacement_batch_size, epochs):
+    def _retrain_batched(self, train_dataset, val_dataset, activation_replacement_batch_size, epochs, callbacks=None):
         """Batched retraining based on activation_replacement_batch_size."""
         history = {'batched': []}
         activation_layers = self.get_activation_layers()
         num_batches = (len(activation_layers) + activation_replacement_batch_size - 1) // activation_replacement_batch_size
+        callbacks = callbacks or []
+
+        # Save initial weights
+        initial_weights = [layer.get_weights() for layer in self.model.layers]
 
         for batch_idx in range(num_batches):
             start_idx = batch_idx * activation_replacement_batch_size
@@ -579,6 +672,8 @@ class ModelWrapper:
             if self.debug.get('print_retrain_debug', False):
                 print(f"\nProcessing batch {batch_idx + 1}/{num_batches}")
 
+            trainable_layers = []
+            
             # Replace activations in this batch
             for activation_layer in batch_layers:
                 self.replace_activation(activation_layer, self.activation_function)
@@ -594,13 +689,15 @@ class ModelWrapper:
                 prev_layer = self.get_trainable_layer_before(activation_layer)
                 next_layer = self.get_trainable_layer_after(activation_layer)
 
-                if prev_layer:
+                if prev_layer and prev_layer.name not in trainable_layers:
                     prev_layer.trainable = True
+                    trainable_layers.append(prev_layer.name)
                     if self.debug.get('print_retrain_debug', False):
                         print(f"Training layer before activation: {prev_layer.name}")
 
-                if next_layer:
+                if next_layer and next_layer.name not in trainable_layers:
                     next_layer.trainable = True
+                    trainable_layers.append(next_layer.name)
                     if self.debug.get('print_retrain_debug', False):
                         print(f"Training layer after activation: {next_layer.name}")
 
@@ -610,23 +707,35 @@ class ModelWrapper:
             # Compile the model
             self.model.compile(
                 optimizer=optimizer,
-                loss=self.config['training']['loss'],
-                metrics=self.config['training']['metrics']
+                loss=self.base_settings['loss'],
+                metrics=self.base_settings['metrics']
             )
 
             # Train the model
-            print(f"Retraining batch {batch_idx + 1}/{num_batches}...")
+            print(f"Retraining after replacing activations in batch {batch_idx + 1}...")
             hist = self.model.fit(
                 train_dataset,
                 epochs=epochs,
-                validation_data=val_dataset
+                validation_data=val_dataset,
+                callbacks=callbacks
             )
+
+            # Check if training improved the model
+            val_loss = hist.history['val_loss'][-1]
+            if val_loss > hist.history['val_loss'][0] * 1.1:  # 10% worse
+                print("Training degraded model performance. Reverting weights...")
+                # Revert weights for trainable layers
+                for layer, weights in zip(self.model.layers, initial_weights):
+                    if layer.name in trainable_layers:
+                        layer.set_weights(weights)
 
             # Record history
             history_entry = {
                 'batch': batch_idx,
-                'phase': 'post_activation_replacement',
-                'history': hist.history
+                'layers': [layer.name for layer in batch_layers],
+                'trainable_layers': trainable_layers,
+                'history': hist.history,
+                'reverted': val_loss > hist.history['val_loss'][0] * 1.1
             }
             history['batched'].append(history_entry)
 
@@ -824,27 +933,34 @@ class ModelWrapper:
         return optimizer
 
     def copy(self) -> 'ModelWrapper':
-        """Create a deep copy of the current ModelWrapper instance."""
-        # Create a new instance with the same configuration
-        new_instance = ModelWrapper(
-            model_name=self.model_name,
-            model_type=self.model_type,
-            model_class=self.model_class,
-            processor_class=self.processor_class,
-            is_huggingface=self.is_huggingface,
-            input_shape=self.input_shape,
-            debug=self.debug.copy(),
-            **copy.deepcopy(self.model_kwargs)
-        )
+        """Create a deep copy of the model wrapper, including a reinitialized optimizer."""
+        new_wrapper = copy.deepcopy(self)
         
-        # Create the base model
-        new_instance.create_base_model()
+        # Get the original model's configuration and weights
+        config = self.model.get_config()
+        weights = self.model.get_weights()
         
-        # Copy weights if the original model has been trained
-        if self.model is not None:
-            new_instance.model.set_weights(self.model.get_weights())
+        # Create a new model with the same architecture
+        new_wrapper.model = tf.keras.Sequential.from_config(config)
+        new_wrapper.model.set_weights(weights)
         
-        return new_instance
+        # Reinitialize the optimizer from the original optimizer's configuration
+        if hasattr(self.model, 'optimizer') and self.model.optimizer is not None:
+            optimizer_config = self.model.optimizer.get_config()
+            optimizer_class = type(self.model.optimizer)
+            new_optimizer = optimizer_class.from_config(optimizer_config)
+            
+            # Compile the new model with the reinitialized optimizer
+            new_wrapper.model.compile(
+                optimizer=new_optimizer,
+                loss=self.model.loss,
+                metrics=self.model.metrics
+            )
+        else:
+            # Compile with default settings if no optimizer exists
+            new_wrapper.compile_model()
+        
+        return new_wrapper
 
     def _validate_activation_replacement(self):
         """Validate that necessary activation replacement parameters are set."""
@@ -935,40 +1051,47 @@ class ModelWrapper:
         plt.close()
 
     def _plot_confusion_matrix(self, X_test, y_test, pdf):
-        """
-        Plot the confusion matrix.
-
-        Args:
-            X_test: Test data.
-            y_test: True labels.
-            pdf: PdfPages object to save the plot.
-        """
+        """Plot confusion matrix for model predictions."""
+        # Make predictions
         y_pred = self.model.predict(X_test)
         y_pred_classes = np.argmax(y_pred, axis=1)
-        y_true = np.argmax(y_test, axis=1)
-
-        cm = confusion_matrix(y_true, y_pred_classes)
-        fig, ax = plt.subplots(figsize=(8, 6))
-        cax = ax.matshow(cm, cmap=plt.cm.Blues)
-        fig.colorbar(cax)
-
-        ax.set_xlabel('Predicted')
-        ax.set_ylabel('True')
-        ax.set_title('Confusion Matrix')
-
-        # Set tick marks
-        classes = np.unique(y_true)
-        ax.set_xticks(range(len(classes)))
-        ax.set_yticks(range(len(classes)))
-        ax.set_xticklabels(classes)
-        ax.set_yticklabels(classes)
-
-        # Annotate each cell
-        for (i, j), z in np.ndenumerate(cm):
-            ax.text(j, i, '{}'.format(z), ha='center', va='center')
-
+        y_true_classes = np.argmax(y_test, axis=1)
+        
+        # Calculate confusion matrix
+        cm = confusion_matrix(y_true_classes, y_pred_classes)
+        
+        # Create figure with two subplots side by side
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 7))
+        
+        # Plot raw confusion matrix
+        im1 = ax1.imshow(cm, interpolation='nearest', cmap=plt.cm.Blues)
+        ax1.set_title('Confusion Matrix (Raw Counts)')
+        fig.colorbar(im1, ax=ax1)
+        
+        # Plot normalized confusion matrix
+        cm_normalized = cm.astype('float') / cm.sum(axis=1)[:, np.newaxis]
+        im2 = ax2.imshow(cm_normalized, interpolation='nearest', cmap=plt.cm.Blues)
+        ax2.set_title('Confusion Matrix (Normalized)')
+        fig.colorbar(im2, ax=ax2)
+        
+        # Add labels to both plots
+        classes = [str(i) for i in range(cm.shape[0])]
+        for ax in [ax1, ax2]:
+            ax.set_xlabel('Predicted label')
+            ax.set_ylabel('True label')
+            ax.set_xticks(np.arange(len(classes)))
+            ax.set_yticks(np.arange(len(classes)))
+            ax.set_xticklabels(classes)
+            ax.set_yticklabels(classes)
+            
+            # Rotate the tick labels and set their alignment
+            plt.setp(ax.get_xticklabels(), rotation=45, ha="right", rotation_mode="anchor")
+        
+        # Add colorbar labels
         plt.tight_layout()
-        pdf.savefig()
+        
+        # Save to PDF
+        pdf.savefig(fig)
         plt.close()
 
     def _plot_classification_report(self, X_test, y_test, pdf):
@@ -1046,6 +1169,11 @@ class ModelWrapper:
 
             # Page 5: Difference in Predictions
             ModelWrapper._plot_prediction_differences(
+                original_model, modified_model, X_test, pdf
+            )
+
+            # Page 6: Raw Output Comparison
+            ModelWrapper._plot_raw_outputs(
                 original_model, modified_model, X_test, pdf
             )
 
@@ -1287,3 +1415,151 @@ class ModelWrapper:
         plt.tight_layout()
         pdf.savefig()
         plt.close()
+
+    @staticmethod
+    def _plot_raw_outputs(original_model, modified_model, X_test, pdf):
+        """
+        Plot comparison of raw model outputs (logits/pre-activation values) for both models.
+        """
+        # First, call the models with a sample input to define their shapes
+        sample_input = X_test[0:1]  # Take first sample and add batch dimension
+        
+        # Get raw outputs by accessing the layer before final activation/softmax
+        orig_outputs = original_model.model.get_layer(index=-2).output
+        mod_outputs = modified_model.model.get_layer(index=-2).output
+        
+        # Create temporary models that output the raw values
+        orig_raw_model = tf.keras.Model(
+            inputs=original_model.model.input, 
+            outputs=orig_outputs
+        )
+        orig_raw_model(sample_input)  # Call once to build the model
+        
+        mod_raw_model = tf.keras.Model(
+            inputs=modified_model.model.input, 
+            outputs=mod_outputs
+        )
+        mod_raw_model(sample_input)  # Call once to build the model
+        
+        # Get raw predictions
+        y_raw_orig = orig_raw_model.predict(X_test)
+        y_raw_mod = mod_raw_model.predict(X_test)
+        
+        # Create figure with multiple subplots
+        fig, axs = plt.subplots(2, 2, figsize=(15, 12))
+        
+        # Plot 1: Distribution of raw outputs
+        axs[0, 0].hist(y_raw_orig.flatten(), bins=50, alpha=0.5, label='Original Model')
+        axs[0, 0].hist(y_raw_mod.flatten(), bins=50, alpha=0.5, label='Modified Model')
+        axs[0, 0].set_title('Raw Output Distributions')
+        axs[0, 0].set_xlabel('Raw Output Value')
+        axs[0, 0].set_ylabel('Frequency')
+        axs[0, 0].legend()
+        axs[0, 0].grid(True)
+        
+        # Plot 2: Scatter plot of raw outputs
+        axs[0, 1].scatter(y_raw_orig.flatten(), y_raw_mod.flatten(), alpha=0.1)
+        axs[0, 1].plot([y_raw_orig.min(), y_raw_orig.max()], 
+                       [y_raw_orig.min(), y_raw_orig.max()], 'r--')
+        axs[0, 1].set_title('Raw Output Comparison')
+        axs[0, 1].set_xlabel('Original Model Raw Outputs')
+        axs[0, 1].set_ylabel('Modified Model Raw Outputs')
+        axs[0, 1].grid(True)
+        
+        # Plot 3: Raw output differences
+        differences = y_raw_orig - y_raw_mod
+        axs[1, 0].hist(differences.flatten(), bins=50, alpha=0.7)
+        axs[1, 0].set_title('Raw Output Differences')
+        axs[1, 0].set_xlabel('Difference (Original - Modified)')
+        axs[1, 0].set_ylabel('Frequency')
+        axs[1, 0].grid(True)
+        
+        # Plot 4: Q-Q plot of differences
+        from scipy import stats
+        stats.probplot(differences.flatten(), dist="norm", plot=axs[1, 1])
+        axs[1, 1].set_title('Q-Q Plot of Raw Output Differences')
+        
+        plt.tight_layout()
+        pdf.savefig()
+        plt.close()
+
+    def validate_model_output(self, expected_classes: int = None):
+        """
+        Validate the model's output shape matches expected number of classes.
+        
+        Args:
+            expected_classes: Expected number of output classes. If None, inferred from model.
+        """
+        output_shape = self.model.output_shape
+        if len(output_shape) != 2:  # (batch_size, num_classes)
+            raise ValueError(f"Expected 2D output shape (batch_size, num_classes), got {output_shape}")
+        
+        actual_classes = output_shape[-1]
+        if expected_classes and actual_classes != expected_classes:
+            raise ValueError(f"Model output shape mismatch. Expected {expected_classes} classes, got {actual_classes}")
+        
+        # Verify final layer activation
+        final_layer = self.model.layers[-1]
+        if not isinstance(final_layer, tf.keras.layers.Dense):
+            raise ValueError(f"Expected final layer to be Dense, got {type(final_layer)}")
+        
+        final_activation = final_layer.activation
+        if final_activation.__name__ != 'softmax':
+            raise ValueError(f"Expected final activation to be softmax, got {final_activation.__name__}")
+
+    def configure_for_classification(self, num_classes: int):
+        """
+        Configure the model wrapper for classification with specified number of classes.
+        
+        Args:
+            num_classes: Number of output classes
+        """
+        self.base_settings.update({
+            'loss': tf.keras.losses.CategoricalCrossentropy(from_logits=False),
+            'metrics': [
+                tf.keras.metrics.CategoricalAccuracy(name='accuracy'),
+                tf.keras.metrics.TopKCategoricalAccuracy(k=min(5, num_classes), name='top_k_accuracy')
+            ]
+        })
+        
+        # Add classification-specific callbacks
+        self.callbacks.extend([
+            tf.keras.callbacks.EarlyStopping(
+                monitor='val_categorical_accuracy',
+                patience=3,
+                restore_best_weights=True
+            ),
+            tf.keras.callbacks.ReduceLROnPlateau(
+                monitor='val_loss',
+                factor=0.2,
+                patience=2,
+                min_lr=1e-6
+            )
+        ])
+
+    def compile_model(self, override_settings=None):
+        """Compile the model with stored or override settings."""
+        settings = self.base_settings.copy()
+        if override_settings:
+            settings.update(override_settings)
+        
+        if hasattr(self.model, 'optimizer') and self.model.optimizer is not None:
+            optimizer_config = self.model.optimizer.get_config()
+            optimizer_class = type(self.model.optimizer)
+            new_optimizer = optimizer_class.from_config(optimizer_config)
+            
+            self.model.compile(
+                optimizer=new_optimizer,
+                loss=settings.get('loss', self.model.loss),
+                metrics=settings.get('metrics', self.model.metrics),
+                **{k: v for k, v in settings.items() 
+                   if k not in ['optimizer', 'loss', 'metrics']}
+            )
+        else:
+            self.model.compile(
+                optimizer=settings.get('optimizer', 'adam'),
+                loss=settings.get('loss', self.model.loss),
+                metrics=settings.get('metrics', self.model.metrics),
+                **{k: v for k, v in settings.items() 
+                   if k not in ['optimizer', 'loss', 'metrics']}
+            )

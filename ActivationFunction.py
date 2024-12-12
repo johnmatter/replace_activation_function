@@ -432,7 +432,10 @@ class ActivationFunctionFactory:
         # The behavior of DataFrame concatenation with empty or all-NA entries is deprecated. In a future 
         # version, this will no longer exclude empty or all-NA columns when determining the result dtypes. To 
         # retain the old behavior, exclude the relevant entries before the concat operation.
-        self.metrics_df = pd.concat([self.metrics_df, new_row], ignore_index=True)
+        if not self.metrics_df.empty:
+            self.metrics_df = pd.concat([self.metrics_df, new_row], ignore_index=True)
+        else:
+            self.metrics_df = new_row
 
         return ActivationFunction(poly, self.base_activation, self.description, metrics)
 
