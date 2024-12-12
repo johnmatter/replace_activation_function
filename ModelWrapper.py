@@ -118,6 +118,9 @@ class ModelWrapper:
         # Initialize other attributes as needed
         self.activation_layer_pairs: List[Tuple[tf.keras.layers.Layer, tf.keras.layers.Activation]] = []
 
+        # Call this method during initialization
+        self._cache_model_config()
+
     def save(self, model_path: str) -> None:
         """Save the model"""
         self.model.save(model_path)
@@ -1424,22 +1427,23 @@ class ModelWrapper:
         # First, call the models with a sample input to define their shapes
         sample_input = X_test[0:1]  # Take first sample and add batch dimension
         
+        # Ensure models are built
+        _ = original_model.model(sample_input)
+        _ = modified_model.model(sample_input)
+        
         # Get raw outputs by accessing the layer before final activation/softmax
         orig_outputs = original_model.model.get_layer(index=-2).output
         mod_outputs = modified_model.model.get_layer(index=-2).output
         
         # Create temporary models that output the raw values
         orig_raw_model = tf.keras.Model(
-            inputs=original_model.model.input, 
+            inputs=original_model.model.input if hasattr(original_model.model, 'input') else original_model.model.inputs,
             outputs=orig_outputs
         )
-        orig_raw_model(sample_input)  # Call once to build the model
-        
         mod_raw_model = tf.keras.Model(
-            inputs=modified_model.model.input, 
+            inputs=modified_model.model.input if hasattr(modified_model.model, 'input') else modified_model.model.inputs,
             outputs=mod_outputs
         )
-        mod_raw_model(sample_input)  # Call once to build the model
         
         # Get raw predictions
         y_raw_orig = orig_raw_model.predict(X_test)
@@ -1563,3 +1567,9 @@ class ModelWrapper:
                 **{k: v for k, v in settings.items() 
                    if k not in ['optimizer', 'loss', 'metrics']}
             )
+
+    def _cache_model_config(self):
+        """Cache model configuration information."""
+        if self.model is not None:
+            self.has_single_input = hasattr(self.model, 'input')
+            self.input_shape = self.model.input_shape if self.has_single_input else self.model.inputs[0].shape
