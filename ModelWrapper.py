@@ -17,6 +17,7 @@ from PIL import Image
 import time
 import copy
 from sklearn.metrics import precision_recall_fscore_support, confusion_matrix, classification_report
+import seaborn as sns
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_pdf import PdfPages
 import pandas as pd
@@ -1004,13 +1005,14 @@ class ModelWrapper:
 
         print(f"Analysis report saved to {report_name}")
 
-    def _plot_training_history(self, history, pdf):
+    def _plot_training_history(self, history, pdf, layer_info=None):
         """
         Plot training and validation accuracy and loss over epochs.
 
         Args:
             history: Training history.
             pdf: PdfPages object to save the plot.
+            layer_info: Optional string describing the layer being plotted.
         """
         fig, axs = plt.subplots(2, 1, figsize=(8, 10))
 
@@ -1025,12 +1027,17 @@ class ModelWrapper:
 
         # Plot accuracy
         if 'accuracy' in hist:
-            axs[0].plot(hist['accuracy'], label='Training Accuracy')
+            axs[0].plot(hist['accuracy'], label='Training Accuracy', linestyle='-', marker='o')
             if 'val_accuracy' in hist:
-                axs[0].plot(hist['val_accuracy'], label='Validation Accuracy')
-            axs[0].set_title('Model Accuracy')
+                axs[0].plot(hist['val_accuracy'], label='Validation Accuracy', linestyle='--', marker='x')
+            if layer_info:
+                axs[0].set_title(f'Model Accuracy - {layer_info}')
+            else:
+                axs[0].set_title('Model Accuracy')
             axs[0].set_xlabel('Epoch')
             axs[0].set_ylabel('Accuracy')
+            axs[0].set_xticks(range(len(hist['accuracy'])))
+            axs[0].set_xticklabels(range(1, len(hist['accuracy']) + 1))
             axs[0].legend()
             axs[0].grid(True)
         else:
@@ -1038,12 +1045,17 @@ class ModelWrapper:
 
         # Plot loss
         if 'loss' in hist:
-            axs[1].plot(hist['loss'], label='Training Loss')
+            axs[1].plot(hist['loss'], label='Training Loss', linestyle='-', marker='o')
             if 'val_loss' in hist:
-                axs[1].plot(hist['val_loss'], label='Validation Loss')
-            axs[1].set_title('Model Loss')
+                axs[1].plot(hist['val_loss'], label='Validation Loss', linestyle='--', marker='x')
+            if layer_info:
+                axs[1].set_title(f'Model Loss - {layer_info}')
+            else:
+                axs[1].set_title('Model Loss')
             axs[1].set_xlabel('Epoch')
             axs[1].set_ylabel('Loss')
+            axs[1].set_xticks(range(len(hist['loss'])))
+            axs[1].set_xticklabels(range(1, len(hist['loss']) + 1))
             axs[1].legend()
             axs[1].grid(True)
         else:
@@ -1054,48 +1066,23 @@ class ModelWrapper:
         plt.close()
 
     def _plot_confusion_matrix(self, X_test, y_test, pdf):
-        """Plot confusion matrix for model predictions."""
-        # Make predictions
+        """
+        Plot confusion matrix with readable text.
+        """
+        
         y_pred = self.model.predict(X_test)
-        y_pred_classes = np.argmax(y_pred, axis=1)
-        y_true_classes = np.argmax(y_test, axis=1)
+        cm = confusion_matrix(y_test.argmax(axis=1), y_pred.argmax(axis=1))
         
-        # Calculate confusion matrix
-        cm = confusion_matrix(y_true_classes, y_pred_classes)
+        fig, ax = plt.subplots(figsize=(8, 6))
+        sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', cbar=False, ax=ax,
+                    annot_kws={"size": 10, "color": "black"})
         
-        # Create figure with two subplots side by side
-        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 7))
+        ax.set_xlabel('Predicted Label')
+        ax.set_ylabel('True Label')
+        ax.set_title('Confusion Matrix')
         
-        # Plot raw confusion matrix
-        im1 = ax1.imshow(cm, interpolation='nearest', cmap=plt.cm.Blues)
-        ax1.set_title('Confusion Matrix (Raw Counts)')
-        fig.colorbar(im1, ax=ax1)
-        
-        # Plot normalized confusion matrix
-        cm_normalized = cm.astype('float') / cm.sum(axis=1)[:, np.newaxis]
-        im2 = ax2.imshow(cm_normalized, interpolation='nearest', cmap=plt.cm.Blues)
-        ax2.set_title('Confusion Matrix (Normalized)')
-        fig.colorbar(im2, ax=ax2)
-        
-        # Add labels to both plots
-        classes = [str(i) for i in range(cm.shape[0])]
-        for ax in [ax1, ax2]:
-            ax.set_xlabel('Predicted label')
-            ax.set_ylabel('True label')
-            ax.set_xticks(np.arange(len(classes)))
-            ax.set_yticks(np.arange(len(classes)))
-            ax.set_xticklabels(classes)
-            ax.set_yticklabels(classes)
-            
-            # Rotate the tick labels and set their alignment
-            plt.setp(ax.get_xticklabels(), rotation=45, ha="right", rotation_mode="anchor")
-        
-        # Add colorbar labels
-        plt.tight_layout()
-        
-        # Save to PDF
         pdf.savefig(fig)
-        plt.close()
+        plt.close(fig)
 
     def _plot_classification_report(self, X_test, y_test, pdf):
         """
@@ -1135,7 +1122,8 @@ class ModelWrapper:
         y_test: np.ndarray,
         original_history: Union[tf.keras.callbacks.History, Dict],
         modified_history: Union[tf.keras.callbacks.History, Dict],
-        report_name: str = "comparison_report.pdf"
+        report_name: str = "comparison_report.pdf",
+        max_points: int = 1000
     ) -> None:
         """
         Generate a PDF report comparing the original and modified models.
@@ -1148,6 +1136,7 @@ class ModelWrapper:
             original_history: Training history of the original model.
             modified_history: Training history of the modified model.
             report_name: Filename for the generated report.
+            max_points: Maximum number of points to plot in heavy plots.
         """
         with PdfPages(report_name) as pdf:
             # Page 1: Training Metrics Comparison
@@ -1177,10 +1166,8 @@ class ModelWrapper:
 
             # Page 6: Raw Output Comparison
             ModelWrapper._plot_raw_outputs(
-                original_model, modified_model, X_test, pdf
+                original_model, modified_model, X_test, pdf, max_points=max_points
             )
-
-            # Additional pages can be added as needed...
 
         print(f"Comparison report saved to {report_name}")
 
@@ -1209,36 +1196,44 @@ class ModelWrapper:
         )
 
         # Plot loss
-        axs[0, 0].plot(orig_hist.get('loss', []), label='Training Loss')
-        axs[0, 0].plot(orig_hist.get('val_loss', []), label='Validation Loss')
+        axs[0, 0].plot(orig_hist.get('loss', []), label='Training Loss', linestyle='-', marker='o')
+        axs[0, 0].plot(orig_hist.get('val_loss', []), label='Validation Loss', linestyle='--', marker='x')
         axs[0, 0].set_title('Original Model Loss')
         axs[0, 0].set_xlabel('Epoch')
         axs[0, 0].set_ylabel('Loss')
+        axs[0, 0].set_xticks(range(len(orig_hist.get('loss', []))))
+        axs[0, 0].set_xticklabels(range(1, len(orig_hist.get('loss', [])) + 1))
         axs[0, 0].legend()
         axs[0, 0].grid(True)
 
-        axs[0, 1].plot(mod_hist.get('loss', []), label='Training Loss')
-        axs[0, 1].plot(mod_hist.get('val_loss', []), label='Validation Loss')
+        axs[0, 1].plot(mod_hist.get('loss', []), label='Training Loss', linestyle='-', marker='o')
+        axs[0, 1].plot(mod_hist.get('val_loss', []), label='Validation Loss', linestyle='--', marker='x')
         axs[0, 1].set_title('Modified Model Loss')
         axs[0, 1].set_xlabel('Epoch')
         axs[0, 1].set_ylabel('Loss')
+        axs[0, 1].set_xticks(range(len(mod_hist.get('loss', []))))
+        axs[0, 1].set_xticklabels(range(1, len(mod_hist.get('loss', [])) + 1))
         axs[0, 1].legend()
         axs[0, 1].grid(True)
 
         # Plot accuracy
-        axs[1, 0].plot(orig_hist.get('accuracy', []), label='Training Accuracy')
-        axs[1, 0].plot(orig_hist.get('val_accuracy', []), label='Validation Accuracy')
+        axs[1, 0].plot(orig_hist.get('accuracy', []), label='Training Accuracy', linestyle='-', marker='o')
+        axs[1, 0].plot(orig_hist.get('val_accuracy', []), label='Validation Accuracy', linestyle='--', marker='x')
         axs[1, 0].set_title('Original Model Accuracy')
         axs[1, 0].set_xlabel('Epoch')
         axs[1, 0].set_ylabel('Accuracy')
+        axs[1, 0].set_xticks(range(len(orig_hist.get('accuracy', []))))
+        axs[1, 0].set_xticklabels(range(1, len(orig_hist.get('accuracy', [])) + 1))
         axs[1, 0].legend()
         axs[1, 0].grid(True)
 
-        axs[1, 1].plot(mod_hist.get('accuracy', []), label='Training Accuracy')
-        axs[1, 1].plot(mod_hist.get('val_accuracy', []), label='Validation Accuracy')
+        axs[1, 1].plot(mod_hist.get('accuracy', []), label='Training Accuracy', linestyle='-', marker='o')
+        axs[1, 1].plot(mod_hist.get('val_accuracy', []), label='Validation Accuracy', linestyle='--', marker='x')
         axs[1, 1].set_title('Modified Model Accuracy')
         axs[1, 1].set_xlabel('Epoch')
         axs[1, 1].set_ylabel('Accuracy')
+        axs[1, 1].set_xticks(range(len(mod_hist.get('accuracy', []))))
+        axs[1, 1].set_xticklabels(range(1, len(mod_hist.get('accuracy', [])) + 1))
         axs[1, 1].legend()
         axs[1, 1].grid(True)
 
@@ -1251,36 +1246,37 @@ class ModelWrapper:
         original_model, modified_model, X_test, y_test, pdf
     ):
         """
-        Plot the confusion matrices for both models.
+        Plot confusion matrices for both models.
 
         Args:
             original_model: The original ModelWrapper instance.
             modified_model: The modified ModelWrapper instance.
             X_test: Test data.
-            y_test: True labels.
+            y_test: True labels for the test data.
             pdf: PdfPages object to save the plot.
         """
+        from sklearn.metrics import confusion_matrix
+        import seaborn as sns
+
         y_pred_orig = original_model.model.predict(X_test)
         y_pred_mod = modified_model.model.predict(X_test)
-        y_pred_classes_orig = np.argmax(y_pred_orig, axis=1)
-        y_pred_classes_mod = np.argmax(y_pred_mod, axis=1)
-        y_true = np.argmax(y_test, axis=1)
+
+        cm_orig = confusion_matrix(y_test.argmax(axis=1), y_pred_orig.argmax(axis=1))
+        cm_mod = confusion_matrix(y_test.argmax(axis=1), y_pred_mod.argmax(axis=1))
 
         fig, axs = plt.subplots(1, 2, figsize=(12, 6))
 
-        # Original Model Confusion Matrix
-        cm_orig = confusion_matrix(y_true, y_pred_classes_orig)
-        axs[0].matshow(cm_orig, cmap=plt.cm.Blues)
+        sns.heatmap(cm_orig, annot=True, fmt='d', cmap='Blues', cbar=False, ax=axs[0],
+                    annot_kws={"size": 10, "color": "black"})
         axs[0].set_title('Original Model Confusion Matrix')
-        axs[0].set_xlabel('Predicted')
-        axs[0].set_ylabel('True')
+        axs[0].set_xlabel('Predicted Label')
+        axs[0].set_ylabel('True Label')
 
-        # Modified Model Confusion Matrix
-        cm_mod = confusion_matrix(y_true, y_pred_classes_mod)
-        axs[1].matshow(cm_mod, cmap=plt.cm.Blues)
+        sns.heatmap(cm_mod, annot=True, fmt='d', cmap='Blues', cbar=False, ax=axs[1],
+                    annot_kws={"size": 10, "color": "black"})
         axs[1].set_title('Modified Model Confusion Matrix')
-        axs[1].set_xlabel('Predicted')
-        axs[1].set_ylabel('True')
+        axs[1].set_xlabel('Predicted Label')
+        axs[1].set_ylabel('True Label')
 
         plt.tight_layout()
         pdf.savefig()
@@ -1420,7 +1416,7 @@ class ModelWrapper:
         plt.close()
 
     @staticmethod
-    def _plot_raw_outputs(original_model, modified_model, X_test, pdf):
+    def _plot_raw_outputs(original_model, modified_model, X_test, pdf, max_points=1000):
         """
         Plot comparison of raw model outputs (logits/pre-activation values) for both models.
         """
@@ -1448,6 +1444,12 @@ class ModelWrapper:
         # Get raw predictions
         y_raw_orig = orig_raw_model.predict(X_test)
         y_raw_mod = mod_raw_model.predict(X_test)
+        
+        # Limit the number of points if max_points is set
+        if max_points is not None:
+            indices = np.random.choice(len(y_raw_orig), size=min(max_points, len(y_raw_orig)), replace=False)
+            y_raw_orig = y_raw_orig[indices]
+            y_raw_mod = y_raw_mod[indices]
         
         # Create figure with multiple subplots
         fig, axs = plt.subplots(2, 2, figsize=(15, 12))
